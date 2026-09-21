@@ -30,6 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--data-dir', default='', help='csv 数据源目录（--source csv 时必填）')
     p.add_argument('--no-cache', action='store_true', help='xtdata 数据源关闭内存缓存')
     p.add_argument('--download', action='store_true', help='回测前先补下载本地日线')
+    p.add_argument('--check-data', action='store_true',
+                   help='只做 xtdata 数据自检并退出（配合 --download 会试下载一只标的）')
 
     p.add_argument('--sectors', default='', help='板块名，逗号分隔，默认 ' + ','.join(CONCEPT_SECTORS_DEFAULT))
     p.add_argument('--lookback', type=int, default=StrategyConfig.lookback_days, help='动量回看天数')
@@ -60,6 +62,12 @@ def make_source(args):
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(not args.quiet)
+
+    if args.check_data:
+        from .diagnostics import check_xtdata
+        ok = check_xtdata(start_date=args.start, end_date=args.end,
+                          try_download=args.download)
+        return 0 if ok else 1
 
     sectors = tuple(s.strip() for s in args.sectors.split(',') if s.strip()) \
         or CONCEPT_SECTORS_DEFAULT

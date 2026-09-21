@@ -63,6 +63,13 @@ python tools/make_sample_data.py --out data/sample --days 700
 python run_backtest.py --source csv --data-dir data/sample --start 20240102 --end 20240630
 ```
 
+数据自检（取不到数据时先跑这个）：
+
+```bash
+python run_backtest.py --check-data              # 逐步定位哪一环取不到数
+python run_backtest.py --check-data --download   # 顺便试下载一只标的
+```
+
 常用参数：`--lookback` 回看天数、`--stop-loss` 止损线、`--decline-days` 连续下降
 清仓天数、`--min-cap/--max-cap` 市值区间、`--sectors` 板块（逗号分隔）、
 `--no-rsrs` 跳过 RSRS、`--no-cache` 关闭行情内存缓存、`-q` 只输出最终统计。
@@ -82,6 +89,7 @@ momentum_strategy/
 │   ├── engine.py       # 回测引擎：交易日循环、调仓、止损、复盘
 │   ├── report.py       # 绩效统计与 csv 输出
 │   ├── sample_data.py  # 合成样例行情
+│   ├── diagnostics.py  # xtdata 数据自检
 │   └── cli.py          # 命令行入口
 ├── tools/make_sample_data.py
 ├── tests/              # pytest，不依赖 QMT
@@ -97,9 +105,10 @@ momentum_strategy/
 python -m pytest
 ```
 
-67 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
+75 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
 「当日 K 线不参与打分」的未来函数检查）、股票池过滤、择时信号、T+1 与费用、
-调仓与止损、绩效统计。
+调仓与止损、绩效统计，以及 xtdata 取数行为（分批、字段退回、无数据报错，
+用桩 xtquant 注入，不需要 QMT）。
 
 ## 与原 QMT 脚本的差异
 
@@ -111,6 +120,23 @@ python -m pytest
 5. **买入数量**：预留佣金，避免满仓下单因手续费不足失败
 6. **连续下降判定**：默认仍是严格比较 `<`；分数几乎相等时浮点噪声会被误判为
    下降，可用 `decline_epsilon` 设相对容差
+
+## 排错：预加载 0 只有数据
+
+`[数据] 预加载完成，0 只有数据` 说明 xtdata 连上了但一根日线都没读到。
+按顺序排查：
+
+1. **本地没下载过日线**（最常见）。`get_trading_dates`、`get_stock_list_in_sector`
+   不需要下载就能返回，所以它们正常不代表 K 线有数据。加 `--download` 重跑，
+   或在 QMT 客户端「行情 → 数据管理 / 数据下载」里补充日线
+2. **QMT 客户端没启动或没登录**。xtdata 只读本机客户端的数据缓存
+3. **字段不被支持**。部分版本不支持 `suspendFlag`，整批请求会直接返回空表；
+   预加载会自动探测并退回核心字段，日志里会提示
+4. **单次请求标的过多**。全市场 5000+ 只一次性请求容易超时或静默返回空，
+   预加载按 300 只一批切分（`PRELOAD_CHUNK_SIZE`）
+
+`python run_backtest.py --check-data` 会把每一步的真实返回打出来，包括列名和
+最后一行数据，直接看卡在哪。预加载为空时回测会立即报错退出，不会空转整段区间。
 
 ## 注意事项
 

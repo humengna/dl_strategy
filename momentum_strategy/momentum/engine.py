@@ -90,6 +90,13 @@ class BacktestEngine:
         self.source.preload(self.base_pool, stock_start, self.config.end_date)
         if self.cfg.rsrs_enabled:
             self.source.preload([self.cfg.rsrs_index], index_start, self.config.end_date)
+
+        if not self.source.has_data(self.base_pool, self.config.end_date):
+            raise RuntimeError(
+                '数据源取不到任何日线数据，回测无法开始。\n'
+                '  - 加 --download 让脚本补下载，或在 QMT 客户端「行情 -> 数据管理」补充日线\n'
+                '  - 用 python run_backtest.py --check-data 逐步定位'
+            )
         return self.base_pool
 
     def run(self, download: bool = False) -> BacktestResult:

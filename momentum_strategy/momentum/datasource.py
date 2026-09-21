@@ -20,6 +20,20 @@ import pandas as pd
 
 from .config import DAILY_FIELDS
 
+# 单次 get_market_data_ex 的标的数量上限。一次性请求几千只容易超时或静默返回空表。
+PRELOAD_CHUNK_SIZE = 300
+
+# 所有 QMT 版本都支持的字段，作为 suspendFlag 不可用时的退路
+CORE_FIELDS = ('open', 'high', 'low', 'close', 'preClose', 'volume')
+
+NO_DATA_HINT = """
+[数据] xtdata 没有返回任何日线数据，请按以下顺序排查：
+  1. QMT / 投研端客户端是否已启动并登录（xtdata 只读本机客户端的数据缓存）
+  2. 本地是否下载过日线 —— 加 --download 重跑，或在客户端
+     「行情 -> 数据管理 / 数据下载」里补充日线数据
+  3. 运行 python run_backtest.py --check-data 逐步定位到底哪一步取不到数
+"""
+
 
 class DataSource(object):
     """数据源接口"""
@@ -54,6 +68,14 @@ class DataSource(object):
         if df is None or len(df) == 0:
             return None
         return df
+
+    def has_data(self, stocks: Sequence[str], end_date: str, sample: int = 20) -> bool:
+        """抽样检查数据源在 end_date 之前是否有日线数据"""
+        probe = list(stocks)[:sample]
+        if not probe:
+            return False
+        data = self.get_bars(probe, end_date, 1)
+        return any(df is not None and len(df) > 0 for df in data.values())
 
     def get_stock_name(self, stock: str) -> str:
         detail = self.get_detail(stock)
@@ -106,6 +128,7 @@ class XtDataSource(DataSource):
         self._xtdata = xtdata
         self.use_cache = use_cache
         self.market = market
+        self.fields = tuple(DAILY_FIELDS)
         self._cache: Dict[str, pd.DataFrame] = {}
         self._detail_cache: Dict[str, Optional[dict]] = {}
 
@@ -126,34 +149,81 @@ class XtDataSource(DataSource):
 
     # ---------- 行情 ----------
 
+    def _raw_fetch(self, fields, stocks, start_date='', end_date='', count=-1):
+        """直接调用 get_market_data_ex，异常时返回空 dict"""
+        try:
+            data = self._xtdata.get_market_data_ex(
+                list(fields), list(stocks),
+                period='1d',
+                start_time=start_date,
+                end_time=end_date,
+                count=count,
+                dividend_type='none',
+                fill_data=True,
+            )
+        except Exception as e:
+            print(f'[数据] get_market_data_ex 调用失败: {e}')
+            return {}
+        return data or {}
+
+    @staticmethod
+    def _any_rows(data) -> bool:
+        return any(df is not None and len(df) > 0 for df in data.values())
+
+    def resolve_fields(self, sample_stocks, start_date='', end_date='') -> bool:
+        """
+        用少量标的探测可用字段。
+
+        某些 QMT 版本不支持 suspendFlag，整批请求会直接返回空表，
+        这里探测失败就退回核心字段，仍然为空则判定为本地无数据。
+        """
+        sample = list(sample_stocks)[:3]
+        if not sample:
+            return False
+
+        for fields in (self.fields, CORE_FIELDS):
+            if self._any_rows(self._raw_fetch(fields, sample, start_date, end_date)):
+                if tuple(fields) != tuple(self.fields):
+                    print(f'[数据] 字段 {sorted(set(self.fields) - set(fields))} 不可用，改用核心字段')
+                    self.fields = tuple(fields)
+                return True
+        return False
+
     def preload(self, stocks, start_date, end_date):
         if not self.use_cache or not stocks:
             return
+
         stocks = list(dict.fromkeys(stocks))
         print(f'[数据] 预加载 {len(stocks)} 只标的 {start_date} ~ {end_date} ...')
-        data = self._xtdata.get_market_data_ex(
-            list(DAILY_FIELDS), stocks,
-            period='1d',
-            start_time=start_date,
-            end_time=end_date,
-            dividend_type='none',
-            fill_data=True,
-        )
+
+        if not self.resolve_fields(stocks, start_date, end_date):
+            print(NO_DATA_HINT)
+            return
+
         loaded = 0
-        for stock in stocks:
-            df = data.get(stock)
-            if df is None or len(df) == 0:
-                continue
-            df = df.copy()
-            df.index = [str(i)[:8] for i in df.index]
-            self._cache[stock] = df
-            loaded += 1
+        total_chunks = (len(stocks) + PRELOAD_CHUNK_SIZE - 1) // PRELOAD_CHUNK_SIZE
+        for idx in range(total_chunks):
+            chunk = stocks[idx * PRELOAD_CHUNK_SIZE:(idx + 1) * PRELOAD_CHUNK_SIZE]
+            data = self._raw_fetch(self.fields, chunk, start_date, end_date)
+            for stock in chunk:
+                df = data.get(stock)
+                if df is None or len(df) == 0:
+                    continue
+                df = df.copy()
+                df.index = [str(i)[:8] for i in df.index]
+                self._cache[stock] = df
+                loaded += 1
+            if total_chunks > 1 and (idx + 1) % 5 == 0:
+                print(f'[数据] 预加载进度 {idx + 1}/{total_chunks} 批，已加载 {loaded} 只')
+
         print(f'[数据] 预加载完成，{loaded} 只有数据')
+        if loaded == 0:
+            print(NO_DATA_HINT)
 
     def get_bars(self, stocks, end_date, count, fields=None):
         if isinstance(stocks, str):
             stocks = [stocks]
-        fields = list(fields or DAILY_FIELDS)
+        fields = list(fields or self.fields)
 
         result: Dict[str, pd.DataFrame] = {}
         missing: List[str] = []
@@ -172,18 +242,7 @@ class XtDataSource(DataSource):
         else:
             missing = list(stocks)
 
-        try:
-            data = self._xtdata.get_market_data_ex(
-                fields, missing,
-                period='1d',
-                end_time=end_date,
-                count=count,
-                dividend_type='none',
-                fill_data=True,
-            )
-        except Exception as e:
-            print(f'[数据] get_market_data_ex 失败: {e}')
-            return result
+        data = self._raw_fetch(fields, missing, end_date=end_date, count=count)
 
         for stock in missing:
             df = data.get(stock)
