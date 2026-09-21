@@ -66,6 +66,13 @@ def filter_universe(source: DataSource, base_pool: Sequence[str],
             except (TypeError, ValueError):
                 pass
 
+        if 'volume' in df.columns:
+            try:
+                if float(df['volume'].iloc[-1]) <= 0:      # 停牌日成交量为 0
+                    continue
+            except (TypeError, ValueError):
+                pass
+
         last_close = float(df['close'].iloc[-1]) if 'close' in df.columns else 0.0
         if last_close <= 0:
             continue

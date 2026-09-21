@@ -16,7 +16,8 @@ from .broker import SimAccount
 from .config import BacktestConfig
 from .datasource import DataSource
 from .progress import Progress
-from .selector import filter_target, momentum_series, pick_target, price_and_limits
+from .selector import (filter_target, is_suspended, momentum_series, pick_target,
+                       price_and_limits)
 from .timing import SIGNAL_SELL, rsrs_value, timing_signal
 from .universe import build_base_pool, filter_universe
 
@@ -248,6 +249,12 @@ class BacktestEngine:
                          f'BUY信号 买入 {target} {volume}股')
 
     def _sell_at_open(self, date: str, stock: str, msg: str) -> None:
+        # 停牌的票卖不掉，只能继续持有 —— 停牌日的 K 线是用前收填充的，
+        # 照着它成交等于凭空按停牌前的价格脱手
+        if is_suspended(self.source, stock, date):
+            log.info('%s 当日停牌，无法卖出，继续持有', stock)
+            return
+
         df = self.source.get_one(stock, date, 1)
         if df is None:
             log.warning('无法获取 %s 价格，卖出跳过', stock)
@@ -267,6 +274,10 @@ class BacktestEngine:
                 continue
             close = float(df['close'].iloc[-1])
             if close <= 0:
+                continue
+
+            if is_suspended(self.source, pos.stock, date):
+                log.info('%s 当日停牌，止损无法执行，继续持有', pos.stock)
                 continue
 
             profit = (close - pos.open_price) / pos.open_price

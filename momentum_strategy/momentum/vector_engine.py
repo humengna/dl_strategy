@@ -183,6 +183,10 @@ class VectorBacktestEngine(BacktestEngine):
         else:
             susp_ok = ~(suspend == 1)
 
+        volume = panel.field('volume')
+        if volume is not None:                       # 停牌日成交量为 0
+            susp_ok = susp_ok & ~(np.isfinite(volume) & (volume <= 0))
+
         if self.cfg.filter_market_cap:
             with np.errstate(invalid='ignore'):
                 cap = np.where(total_value[None, :] > 0, total_value[None, :],

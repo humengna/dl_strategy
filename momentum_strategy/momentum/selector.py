@@ -87,6 +87,35 @@ def momentum_series(source: DataSource, stock: str, date: str,
     return scores
 
 
+def is_suspended(source: DataSource, stock: str, date: str) -> bool:
+    """
+    当日是否停牌 / 不可交易。
+
+    停牌日 xtdata 在 fill_data=True 下会用前收把 K 线填满（开=高=低=收=前收、
+    成交量为 0），光看价格分辨不出来，必须靠 suspendFlag 或成交量判断。
+    取不到数据同样按不可交易处理。
+    """
+    df = source.get_one(stock, date, 1)
+    if df is None or len(df) == 0:
+        return True
+
+    if 'suspendFlag' in df.columns:
+        try:
+            if int(df['suspendFlag'].iloc[-1]) == 1:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    if 'volume' in df.columns:
+        try:
+            if float(df['volume'].iloc[-1]) <= 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    return False
+
+
 def filter_target(source: DataSource, stock: Optional[str], date: str,
                   cfg: StrategyConfig) -> Optional[str]:
     """
@@ -99,17 +128,13 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
     if not stock:
         return None
 
+    if is_suspended(source, stock, date):
+        log.info('%s 当日停牌', stock)
+        return None
+
     df = source.get_one(stock, date, 1)
     if df is None:
         return None
-
-    if 'suspendFlag' in df.columns:
-        try:
-            if int(df['suspendFlag'].iloc[-1]) == 1:
-                log.info('%s 停牌中', stock)
-                return None
-        except (TypeError, ValueError):
-            pass
 
     # 数据有效性用开盘价判断：它既是成交价，也是开盘时点就已知的值
     open_price = float(df['open'].iloc[-1]) if 'open' in df.columns else 0.0

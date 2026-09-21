@@ -221,3 +221,101 @@ def test_rsrs_returns_none_without_enough_history():
     from momentum.timing import rsrs_value
     source = make_source(days=80, start='20240102')
     assert rsrs_value(source, '20240501', StrategyConfig()) is None
+
+
+# ---------------- 停牌不可交易 ----------------
+
+def _suspended_source(source_factory, suspend_last=True, zero_volume=False):
+    """最后一天停牌：K 线被前收填满（开=高=低=收=前收），成交量为 0"""
+    from momentum.sample_data import make_calendar
+
+    dates = make_calendar(30, start='20240102')
+    closes = [10.0] * 29 + [10.0]
+    frame = make_frame(dates, closes, opens=[10.0] * 30, pre_closes=[10.0] * 30,
+                       suspend=([0] * 29 + [1]) if suspend_last else None)
+    if zero_volume:
+        frame.loc[frame.index[-1], 'volume'] = 0
+    return dates, source_factory({'600000.SH': frame})
+
+
+def test_cannot_sell_suspended_stock(source_factory):
+    """停牌日 K 线是前收填充的，照着它成交等于按停牌前的价格脱手"""
+    dates, source = _suspended_source(source_factory)
+    engine = make_engine(source, dates[0], dates[-1])
+    engine.account.buy(dates[-2], '600000.SH', 10.0, 1000)
+    engine.account.settle_open()
+
+    engine.adjust_position(dates[-1], '000001.SZ', SIGNAL_SELL)
+
+    assert engine.account.positions['600000.SH'].volume == 1000   # 仍然持有
+    assert engine.account.deals[-1].direction == 1                # 最后一笔还是当初的买入
+
+
+def test_cannot_switch_out_of_suspended_stock(source_factory):
+    dates, source = _suspended_source(source_factory)
+    engine = make_engine(source, dates[0], dates[-1])
+    engine.account.buy(dates[-2], '600000.SH', 10.0, 1000)
+    engine.account.settle_open()
+
+    engine.adjust_position(dates[-1], '000001.SZ', SIGNAL_BUY)
+
+    assert '600000.SH' in engine.account.positions
+
+
+def test_stop_loss_blocked_by_suspension(source_factory):
+    """停牌时止损也执行不了，只能继续持有"""
+    from momentum.sample_data import make_calendar
+
+    dates = make_calendar(30, start='20240102')
+    closes = [10.0] * 29 + [5.0]        # 相对成本 -50%，正常必然触发止损
+    frame = make_frame(dates, closes, opens=[10.0] * 30, pre_closes=[10.0] * 30,
+                       suspend=[0] * 29 + [1])
+    source = source_factory({'600000.SH': frame})
+
+    engine = make_engine(source, dates[0], dates[-1])
+    engine.account.buy(dates[0], '600000.SH', 10.0, 1000)
+    engine.account.settle_open()
+
+    engine.check_stop_loss(dates[-1])
+    assert engine.account.positions['600000.SH'].volume == 1000
+
+    # 换成没停牌的同一天，就应该止损出去
+    frame2 = make_frame(dates, closes, opens=[10.0] * 30, pre_closes=[10.0] * 30)
+    engine2 = make_engine(source_factory({'600000.SH': frame2}), dates[0], dates[-1])
+    engine2.account.buy(dates[0], '600000.SH', 10.0, 1000)
+    engine2.account.settle_open()
+    engine2.check_stop_loss(dates[-1])
+    assert engine2.account.positions == {}
+
+
+def test_zero_volume_counts_as_suspended(source_factory):
+    """有些数据没有 suspendFlag，成交量为 0 同样说明当天不可交易"""
+    dates, source = _suspended_source(source_factory, suspend_last=False, zero_volume=True)
+    engine = make_engine(source, dates[0], dates[-1])
+    engine.account.buy(dates[-2], '600000.SH', 10.0, 1000)
+    engine.account.settle_open()
+
+    engine.adjust_position(dates[-1], '000001.SZ', SIGNAL_SELL)
+    assert engine.account.positions['600000.SH'].volume == 1000
+
+
+def test_suspended_stock_sells_once_resumed(source_factory):
+    """复牌当天就应该正常卖出"""
+    from momentum.sample_data import make_calendar
+
+    dates = make_calendar(31, start='20240102')
+    frame = make_frame(dates, [10.0] * 30 + [9.0], opens=[10.0] * 30 + [9.0],
+                       pre_closes=[10.0] * 31, suspend=[0] * 29 + [1, 0])
+    source = source_factory({'600000.SH': frame})
+
+    engine = make_engine(source, dates[0], dates[-1])
+    engine.account.buy(dates[-3], '600000.SH', 10.0, 1000)
+    engine.account.settle_open()
+
+    engine.adjust_position(dates[-2], '000001.SZ', SIGNAL_SELL)     # 停牌日
+    assert '600000.SH' in engine.account.positions
+
+    engine.account.settle_open()
+    engine.adjust_position(dates[-1], '000001.SZ', SIGNAL_SELL)     # 复牌日
+    assert engine.account.positions == {}
+    assert engine.account.deals[-1].price == pytest.approx(9.0)

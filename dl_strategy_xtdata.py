@@ -1388,6 +1388,13 @@ def filter_universe(source: DataSource, base_pool: Sequence[str],
             except (TypeError, ValueError):
                 pass
 
+        if 'volume' in df.columns:
+            try:
+                if float(df['volume'].iloc[-1]) <= 0:      # 停牌日成交量为 0
+                    continue
+            except (TypeError, ValueError):
+                pass
+
         last_close = float(df['close'].iloc[-1]) if 'close' in df.columns else 0.0
         if last_close <= 0:
             continue
@@ -1497,6 +1504,35 @@ def momentum_series(source: DataSource, stock: str, date: str,
     return scores
 
 
+def is_suspended(source: DataSource, stock: str, date: str) -> bool:
+    """
+    当日是否停牌 / 不可交易。
+
+    停牌日 xtdata 在 fill_data=True 下会用前收把 K 线填满（开=高=低=收=前收、
+    成交量为 0），光看价格分辨不出来，必须靠 suspendFlag 或成交量判断。
+    取不到数据同样按不可交易处理。
+    """
+    df = source.get_one(stock, date, 1)
+    if df is None or len(df) == 0:
+        return True
+
+    if 'suspendFlag' in df.columns:
+        try:
+            if int(df['suspendFlag'].iloc[-1]) == 1:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    if 'volume' in df.columns:
+        try:
+            if float(df['volume'].iloc[-1]) <= 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    return False
+
+
 def filter_target(source: DataSource, stock: Optional[str], date: str,
                   cfg: StrategyConfig) -> Optional[str]:
     """
@@ -1509,17 +1545,13 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
     if not stock:
         return None
 
+    if is_suspended(source, stock, date):
+        log.info('%s 当日停牌', stock)
+        return None
+
     df = source.get_one(stock, date, 1)
     if df is None:
         return None
-
-    if 'suspendFlag' in df.columns:
-        try:
-            if int(df['suspendFlag'].iloc[-1]) == 1:
-                log.info('%s 停牌中', stock)
-                return None
-        except (TypeError, ValueError):
-            pass
 
     # 数据有效性用开盘价判断：它既是成交价，也是开盘时点就已知的值
     open_price = float(df['open'].iloc[-1]) if 'open' in df.columns else 0.0
@@ -1868,6 +1900,12 @@ class BacktestEngine:
                          f'BUY信号 买入 {target} {volume}股')
 
     def _sell_at_open(self, date: str, stock: str, msg: str) -> None:
+        # 停牌的票卖不掉，只能继续持有 —— 停牌日的 K 线是用前收填充的，
+        # 照着它成交等于凭空按停牌前的价格脱手
+        if is_suspended(self.source, stock, date):
+            log.info('%s 当日停牌，无法卖出，继续持有', stock)
+            return
+
         df = self.source.get_one(stock, date, 1)
         if df is None:
             log.warning('无法获取 %s 价格，卖出跳过', stock)
@@ -1887,6 +1925,10 @@ class BacktestEngine:
                 continue
             close = float(df['close'].iloc[-1])
             if close <= 0:
+                continue
+
+            if is_suspended(self.source, pos.stock, date):
+                log.info('%s 当日停牌，止损无法执行，继续持有', pos.stock)
                 continue
 
             profit = (close - pos.open_price) / pos.open_price
@@ -2103,6 +2145,10 @@ class VectorBacktestEngine(BacktestEngine):
             susp_ok = np.ones((n, m), dtype=bool)
         else:
             susp_ok = ~(suspend == 1)
+
+        volume = panel.field('volume')
+        if volume is not None:                       # 停牌日成交量为 0
+            susp_ok = susp_ok & ~(np.isfinite(volume) & (volume <= 0))
 
         if self.cfg.filter_market_cap:
             with np.errstate(invalid='ignore'):
