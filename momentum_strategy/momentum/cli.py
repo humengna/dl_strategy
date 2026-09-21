@@ -46,6 +46,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--max-cap', type=float, default=StrategyConfig.max_market_cap, help='市值上限')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
 
+    p.add_argument('--commission', type=float, default=AccountConfig.commission_rate,
+                   help='佣金费率，双边，默认 1e-4（万 1）')
+    p.add_argument('--min-commission', type=float, default=AccountConfig.min_commission,
+                   help='单笔最低佣金，默认 5 元')
+    p.add_argument('--transfer-fee', type=float, default=AccountConfig.transfer_fee_rate,
+                   help='过户费费率，双边，默认 1e-5（千分之 0.01）')
+    p.add_argument('--stamp-tax', type=float, default=AccountConfig.stamp_tax_rate,
+                   help='印花税费率，仅卖出，默认 5e-4（千分之 0.5）')
+
     p.add_argument('--engine', choices=['fast', 'loop'], default='fast',
                    help='fast=向量化引擎（默认）；loop=逐日引擎，慢很多，用于交叉验证')
     p.add_argument('--out-dir', default='',
@@ -93,7 +102,13 @@ def main(argv=None) -> int:
             max_market_cap=args.max_cap,
             rsrs_enabled=not args.no_rsrs,
         ),
-        account=AccountConfig(init_cash=args.cash),
+        account=AccountConfig(
+            init_cash=args.cash,
+            commission_rate=args.commission,
+            min_commission=args.min_commission,
+            transfer_fee_rate=args.transfer_fee,
+            stamp_tax_rate=args.stamp_tax,
+        ),
     )
 
     engine_cls = VectorBacktestEngine if args.engine == 'fast' else BacktestEngine

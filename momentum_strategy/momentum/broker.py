@@ -84,20 +84,40 @@ class SimAccount:
 
     # ---------- 费用 ----------
 
-    def buy_fee(self, amount: float) -> float:
+    def commission(self, amount: float) -> float:
+        """佣金：按成交额比例收取，单笔不足最低值时按最低值"""
         return max(amount * self.cfg.commission_rate, self.cfg.min_commission)
 
+    def buy_fee(self, amount: float) -> float:
+        """买入：佣金 + 过户费"""
+        return self.commission(amount) + amount * self.cfg.transfer_fee_rate
+
     def sell_fee(self, amount: float) -> float:
-        commission = max(amount * self.cfg.commission_rate, self.cfg.min_commission)
-        return commission + amount * self.cfg.stamp_tax_rate
+        """卖出：佣金 + 过户费 + 印花税"""
+        return (self.commission(amount)
+                + amount * self.cfg.transfer_fee_rate
+                + amount * self.cfg.stamp_tax_rate)
 
     def affordable_volume(self, price: float) -> int:
-        """按可用资金算出能买的最大整手数量（已预留佣金）"""
+        """
+        按可用资金算出能买的最大整手数量。
+
+        先用比例费用估一个上界，再逐手回退到「成交额 + 实际费用 <= 可用资金」，
+        这样最低佣金（小额下单时费用远高于比例值）也能被正确预留。
+        """
         if price <= 0:
             return 0
+
         lot = self.cfg.lot_size
-        raw = self.cash / (price * (1 + self.cfg.commission_rate))
-        return int(raw / lot) * lot
+        raw = self.cash / (price * (1 + self.cfg.buy_cost_rate))
+        volume = int(raw / lot) * lot
+
+        while volume >= lot:
+            amount = price * volume
+            if amount + self.buy_fee(amount) <= self.cash + 1e-6:
+                return volume
+            volume -= lot
+        return 0
 
     # ---------- 交易 ----------
 

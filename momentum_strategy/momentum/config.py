@@ -90,11 +90,25 @@ class AccountConfig:
     """模拟账户参数"""
 
     init_cash: float = 200000.0
-    commission_rate: float = 2.5e-4        # 佣金万 2.5
-    min_commission: float = 5.0            # 单笔最低 5 元
-    stamp_tax_rate: float = 5e-4           # 卖出印花税万 5
+
+    # 交易费用（A 股现行规则）
+    commission_rate: float = 1e-4          # 佣金万 1，买卖双边
+    min_commission: float = 5.0            # 佣金单笔最低 5 元
+    transfer_fee_rate: float = 1e-5        # 过户费千分之 0.01，买卖双边
+    stamp_tax_rate: float = 5e-4           # 印花税千分之 0.5，仅卖出
+
     lot_size: int = 100                    # 一手股数
     t_plus_one: bool = True                # 当日买入次日才可卖
+
+    @property
+    def buy_cost_rate(self) -> float:
+        """买入的比例费用合计（不含最低佣金）"""
+        return self.commission_rate + self.transfer_fee_rate
+
+    @property
+    def sell_cost_rate(self) -> float:
+        """卖出的比例费用合计（不含最低佣金）"""
+        return self.commission_rate + self.transfer_fee_rate + self.stamp_tax_rate
 
 
 @dataclass

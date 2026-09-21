@@ -282,11 +282,25 @@ class AccountConfig:
     """模拟账户参数"""
 
     init_cash: float = 200000.0
-    commission_rate: float = 2.5e-4        # 佣金万 2.5
-    min_commission: float = 5.0            # 单笔最低 5 元
-    stamp_tax_rate: float = 5e-4           # 卖出印花税万 5
+
+    # 交易费用（A 股现行规则）
+    commission_rate: float = 1e-4          # 佣金万 1，买卖双边
+    min_commission: float = 5.0            # 佣金单笔最低 5 元
+    transfer_fee_rate: float = 1e-5        # 过户费千分之 0.01，买卖双边
+    stamp_tax_rate: float = 5e-4           # 印花税千分之 0.5，仅卖出
+
     lot_size: int = 100                    # 一手股数
     t_plus_one: bool = True                # 当日买入次日才可卖
+
+    @property
+    def buy_cost_rate(self) -> float:
+        """买入的比例费用合计（不含最低佣金）"""
+        return self.commission_rate + self.transfer_fee_rate
+
+    @property
+    def sell_cost_rate(self) -> float:
+        """卖出的比例费用合计（不含最低佣金）"""
+        return self.commission_rate + self.transfer_fee_rate + self.stamp_tax_rate
 
 
 @dataclass
@@ -774,20 +788,40 @@ class SimAccount:
 
     # ---------- 费用 ----------
 
-    def buy_fee(self, amount: float) -> float:
+    def commission(self, amount: float) -> float:
+        """佣金：按成交额比例收取，单笔不足最低值时按最低值"""
         return max(amount * self.cfg.commission_rate, self.cfg.min_commission)
 
+    def buy_fee(self, amount: float) -> float:
+        """买入：佣金 + 过户费"""
+        return self.commission(amount) + amount * self.cfg.transfer_fee_rate
+
     def sell_fee(self, amount: float) -> float:
-        commission = max(amount * self.cfg.commission_rate, self.cfg.min_commission)
-        return commission + amount * self.cfg.stamp_tax_rate
+        """卖出：佣金 + 过户费 + 印花税"""
+        return (self.commission(amount)
+                + amount * self.cfg.transfer_fee_rate
+                + amount * self.cfg.stamp_tax_rate)
 
     def affordable_volume(self, price: float) -> int:
-        """按可用资金算出能买的最大整手数量（已预留佣金）"""
+        """
+        按可用资金算出能买的最大整手数量。
+
+        先用比例费用估一个上界，再逐手回退到「成交额 + 实际费用 <= 可用资金」，
+        这样最低佣金（小额下单时费用远高于比例值）也能被正确预留。
+        """
         if price <= 0:
             return 0
+
         lot = self.cfg.lot_size
-        raw = self.cash / (price * (1 + self.cfg.commission_rate))
-        return int(raw / lot) * lot
+        raw = self.cash / (price * (1 + self.cfg.buy_cost_rate))
+        volume = int(raw / lot) * lot
+
+        while volume >= lot:
+            amount = price * volume
+            if amount + self.buy_fee(amount) <= self.cash + 1e-6:
+                return volume
+            volume -= lot
+        return 0
 
     # ---------- 交易 ----------
 
@@ -2688,6 +2722,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--max-cap', type=float, default=StrategyConfig.max_market_cap, help='市值上限')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
 
+    p.add_argument('--commission', type=float, default=AccountConfig.commission_rate,
+                   help='佣金费率，双边，默认 1e-4（万 1）')
+    p.add_argument('--min-commission', type=float, default=AccountConfig.min_commission,
+                   help='单笔最低佣金，默认 5 元')
+    p.add_argument('--transfer-fee', type=float, default=AccountConfig.transfer_fee_rate,
+                   help='过户费费率，双边，默认 1e-5（千分之 0.01）')
+    p.add_argument('--stamp-tax', type=float, default=AccountConfig.stamp_tax_rate,
+                   help='印花税费率，仅卖出，默认 5e-4（千分之 0.5）')
+
     p.add_argument('--engine', choices=['fast', 'loop'], default='fast',
                    help='fast=向量化引擎（默认）；loop=逐日引擎，慢很多，用于交叉验证')
     p.add_argument('--out-dir', default='',
@@ -2732,7 +2775,13 @@ def main(argv=None) -> int:
             max_market_cap=args.max_cap,
             rsrs_enabled=not args.no_rsrs,
         ),
-        account=AccountConfig(init_cash=args.cash),
+        account=AccountConfig(
+            init_cash=args.cash,
+            commission_rate=args.commission,
+            min_commission=args.min_commission,
+            transfer_fee_rate=args.transfer_fee,
+            stamp_tax_rate=args.stamp_tax,
+        ),
     )
 
     engine_cls = VectorBacktestEngine if args.engine == 'fast' else BacktestEngine

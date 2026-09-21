@@ -81,8 +81,19 @@ RSRS 修正标准分（N=21, M=600, 沪深300）**只计算和打印，不参与
 | `decline_days_to_sell` | 2 | `sig >= 2` |
 | `warmup_days` | 15 | `bar_count < LOOKBACK_DAYS + 10` |
 
-账户参数在 `AccountConfig`：初始资金、佣金万 2.5（单笔最低 5 元）、印花税万 5、
-一手 100 股、T+1。
+账户参数在 `AccountConfig`：
+
+| 费用 | 默认值 | 收取方式 |
+|---|---|---|
+| 佣金 `commission_rate` | 1e-4（万 1） | 买卖双边，单笔最低 `min_commission` 5 元 |
+| 过户费 `transfer_fee_rate` | 1e-5（千分之 0.01） | 买卖双边 |
+| 印花税 `stamp_tax_rate` | 5e-4（千分之 0.5） | 仅卖出 |
+
+成交额较大时往返成本 = 万1×2 + 千分之0.01×2 + 千分之0.5 = **0.072%**；
+小额下单受最低佣金影响会更高（成交额 1 万时往返 0.152%）。
+四个费率都能在命令行覆盖：`--commission`、`--min-commission`、`--transfer-fee`、`--stamp-tax`。
+
+另有一手 100 股、T+1（当日买入次日才可卖）。
 
 ## 安装
 
@@ -124,7 +135,8 @@ python run_backtest.py --check-data --download   # 顺便试下载一只标的
 常用参数：`--lookback` 回看天数、`--stop-loss` 止损线、`--decline-days` 连续下降
 清仓天数、`--min-cap/--max-cap` 市值区间、`--sectors` 板块（逗号分隔）、
 `--no-rsrs` 跳过 RSRS、`--no-cache` 关闭行情内存缓存、`--engine loop` 切回逐日引擎、
-`--out-dir` 指定结果目录、`--no-save` 不保存结果、`-q` 只输出进度条和最终统计。
+`--out-dir` 指定结果目录、`--no-save` 不保存结果、`-q` 只输出进度条和最终统计，
+以及上面那四个费率参数。
 
 ## 项目结构
 
