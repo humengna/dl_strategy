@@ -319,3 +319,84 @@ def test_suspended_stock_sells_once_resumed(source_factory):
     engine.adjust_position(dates[-1], '000001.SZ', SIGNAL_SELL)     # 复牌日
     assert engine.account.positions == {}
     assert engine.account.deals[-1].price == pytest.approx(9.0)
+
+
+def test_full_backtest_holds_through_suspension_then_sells_on_resume(source_factory):
+    """
+    端到端：持仓中途停牌若干天
+      - 停牌期间目标股已经切走，但旧仓卖不掉，持仓和现金都不动
+      - 复牌当天必须卖出
+    """
+    import pandas as pd
+
+    from momentum.sample_data import make_calendar
+    from momentum.vector_engine import VectorBacktestEngine
+
+    dates = make_calendar(40, start='20240102')
+    halt = dates[29:32]                       # 连停 3 天
+
+    def build_frame(closes, suspend):
+        opens = list(closes)
+        pre = [closes[0]] + list(closes[:-1])
+        return pd.DataFrame({
+            'open': opens, 'high': [c * 1.01 for c in closes],
+            'low': [c * 0.99 for c in closes], 'close': list(closes), 'preClose': pre,
+            'volume': [0.0 if f else 1e6 for f in suspend],
+            'suspendFlag': [float(f) for f in suspend],
+        }, index=dates)
+
+    # 加速上涨：动量分数逐日走高，信号稳定为 BUY
+    # （完美指数增长会让各窗口分数数学上完全相等，信号被浮点噪声左右）
+    import numpy as np
+    leader = list(10 * np.exp(np.cumsum(np.linspace(0.002, 0.02, 40))))
+    for i in (29, 30, 31):
+        leader[i] = leader[28]                # 停牌日 K 线按前收填满
+    flags = [0] * 29 + [1, 1, 1] + [0] * 8
+
+    frames = {'600000.SH': build_frame(leader, flags),
+              '000001.SZ': build_frame([20.0] * 40, [0] * 40)}
+    source = source_factory(frames)
+
+    engine = VectorBacktestEngine(
+        source,
+        BacktestConfig(start_date=dates[20], end_date=dates[-1],
+                       strategy=StrategyConfig(lookback_days=5, rsrs_enabled=False),
+                       account=AccountConfig(init_cash=200000.0)))
+    result = engine.run()
+    rows = {r.date: r for r in result.daily}
+
+    # 停牌前已经持有领涨股
+    assert rows[dates[28]].stock == '600000.SH'
+
+    # 停牌期间：目标已切走，持仓和现金纹丝不动，且没有任何成交
+    frozen = rows[dates[28]]
+    for day in halt:
+        assert rows[day].stock == '600000.SH', f'{day} 不该被卖掉'
+        assert rows[day].volume == frozen.volume
+        assert rows[day].cash == pytest.approx(frozen.cash)
+    assert not [d for d in engine.account.deals if d.date in halt]
+
+    # 复牌当天卖出
+    resume = dates[32]
+    sells = [d for d in engine.account.deals if d.date == resume and d.direction == -1]
+    assert sells and sells[0].stock == '600000.SH'
+    assert sells[0].price != pytest.approx(frozen.cost)    # 按复牌当天的真实价，不是停牌前的填充价
+
+
+def test_suspended_holding_blocks_new_buy(source_factory):
+    """停牌期间资金锁在旧仓里，不该冒出第二个持仓"""
+    from momentum.sample_data import make_calendar
+
+    dates = make_calendar(30, start='20240102')
+    frame = make_frame(dates, [10.0] * 30, opens=[10.0] * 30, pre_closes=[10.0] * 30,
+                       suspend=[0] * 29 + [1])
+    other = make_frame(dates, [20.0] * 30, opens=[20.0] * 30, pre_closes=[20.0] * 30)
+    source = source_factory({'600000.SH': frame, '000001.SZ': other})
+
+    engine = make_engine(source, dates[0], dates[-1], cash=200000.0)
+    engine.account.buy(dates[-2], '600000.SH', 10.0, 19900)      # 几乎满仓
+    engine.account.settle_open()
+
+    engine.adjust_position(dates[-1], '000001.SZ', SIGNAL_BUY)
+
+    assert set(engine.account.positions) == {'600000.SH'}

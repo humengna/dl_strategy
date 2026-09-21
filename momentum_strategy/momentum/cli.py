@@ -105,10 +105,13 @@ QMT_PRESET = {
     'dividend_type': 'none',      # 原脚本 dividend_type='none'
     'filter_limit_down': True,    # 原脚本按当日收盘价判断跌停
     'limit_down_ratio': 0.10,     # 且恒用固定 10%，不区分创业板/科创板
-    'allow_sell_suspended': True, # 原脚本卖出端不查停牌
     'no_fee_reserve': True,       # 原脚本买入量不预留手续费
     'skip_warmup': True,          # 原脚本前 LOOKBACK+10 根 bar 不交易
 }
+
+# 原脚本卖出端不查停牌，会按前收填充价把停牌股脱手 —— 这一条实盘根本做不到，
+# 默认不复刻；确实要完全对齐原脚本时另加 --allow-sell-suspended
+QMT_NOT_REPLICATED = 'allow_sell_suspended'
 
 
 def apply_qmt_preset(args) -> None:
@@ -116,9 +119,12 @@ def apply_qmt_preset(args) -> None:
     for key, value in QMT_PRESET.items():
         setattr(args, key, value)
     print('[复刻模式] 已切换到原 QMT 脚本口径：')
-    print('  市值过滤关闭 / 不复权 / 跌停按固定 10% 过滤 / 停牌可卖出')
+    print('  市值过滤关闭 / 不复权 / 跌停按固定 10% 过滤')
     print('  / 买入不预留费用 / 开头预热期不交易')
     print('  注意：这些是为了对齐原脚本而保留的缺陷，结果会偏乐观，不要用来评估策略本身')
+    if not getattr(args, QMT_NOT_REPLICATED, False):
+        print('  唯一没有复刻的一项：停牌股仍然卖不掉，要等复牌当天才卖')
+        print('  （原脚本会按前收填充价脱手，实盘做不到；加 --allow-sell-suspended 可对齐）')
 
 
 def run_label(args, cfg: StrategyConfig) -> str:

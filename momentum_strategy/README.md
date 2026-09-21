@@ -203,7 +203,7 @@ momentum_strategy/
 python -m pytest
 ```
 
-175 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
+178 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
 「当日 K 线不参与打分」的未来函数检查）、股票池过滤、择时信号、T+1 与费用、
 调仓与止损、绩效统计，以及 xtdata 取数行为（分批、字段退回、无数据报错，
 用桩 xtquant 注入，不需要 QMT）、进度条渲染、
@@ -277,12 +277,16 @@ python run_backtest.py --start 20240101 --end 20241231 --replicate-qmt
 | 市值过滤 | 兜底分支引用未定义的 `last_close`，异常被吞 → 池子=全市场 | 过滤生效 | `--no-cap-filter` |
 | 复权 | `dividend_type='none'` 不复权 | 后复权 | `--dividend-type none` |
 | 跌停过滤 | 用当日收盘价、恒定 10% | 关闭（未来函数） | `--filter-limit-down --limit-down-ratio 0.10` |
-| 停牌卖出 | 卖出端不查停牌，按前收填充价成交 | 停牌不能卖 | `--allow-sell-suspended` |
+| 停牌卖出 | 卖出端不查停牌，按前收填充价成交 | 停牌不能卖，复牌当天才卖 | `--allow-sell-suspended`（**不在预设内**） |
 | 买入数量 | `int(可用资金/价格/100)*100`，不留费用 | 预留费用并逐手回退 | `--no-fee-reserve` |
 | 预热 | `bar_count < LOOKBACK+10` 时 return | 有数据即交易 | `--skip-warmup` |
 
 每个开关也能单独使用，混搭出中间口径。结果目录会带 `qmt` 标签，`summary.json`
 里记录 `replicate_qmt: true` 与每一项的具体取值。
+
+**停牌卖出这一条不在预设里**：原脚本按前收填充价把停牌股脱手，实盘根本做不到，
+复刻模式下仍然是「停牌卖不掉、复牌当天才卖」。确实要逐笔对齐原脚本时再加
+`--allow-sell-suspended`。
 
 **复刻口径的结果偏乐观**，不要用它评估策略本身：停牌能按停牌前的价格脱手、
 跌停过滤用到了当日收盘价，这两项都是实盘做不到的。

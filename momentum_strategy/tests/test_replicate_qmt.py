@@ -161,12 +161,23 @@ def test_preset_flips_every_switch():
     assert args.dividend_type == 'none'
     assert args.filter_limit_down is True
     assert args.limit_down_ratio == 0.10
-    assert args.allow_sell_suspended is True
     assert args.no_fee_reserve is True
     assert args.skip_warmup is True
     assert set(QMT_PRESET) == {'no_cap_filter', 'dividend_type', 'filter_limit_down',
-                               'limit_down_ratio', 'allow_sell_suspended',
-                               'no_fee_reserve', 'skip_warmup'}
+                               'limit_down_ratio', 'no_fee_reserve', 'skip_warmup'}
+
+
+def test_preset_does_not_replicate_selling_suspended():
+    """停牌股脱手实盘做不到，复刻预设里不带这一条"""
+    args = build_parser().parse_args(['--replicate-qmt'])
+    apply_qmt_preset(args)
+    assert args.allow_sell_suspended is False
+    assert 'allow_sell_suspended' not in QMT_PRESET
+
+    # 显式加上仍然可以对齐原脚本
+    args = build_parser().parse_args(['--replicate-qmt', '--allow-sell-suspended'])
+    apply_qmt_preset(args)
+    assert args.allow_sell_suspended is True
 
 
 def test_preset_tags_output_dir():
@@ -199,7 +210,7 @@ def test_preset_end_to_end(sample_dir, tmp_path):
     assert payload['strategy']['filter_market_cap'] is False
     assert payload['strategy']['filter_limit_down'] is True
     assert payload['strategy']['limit_down_ratio'] == 0.10
-    assert payload['strategy']['allow_sell_suspended'] is True
+    assert payload['strategy']['allow_sell_suspended'] is False
     assert payload['strategy']['skip_warmup_bars'] is True
     assert payload['account']['reserve_fee_on_buy'] is False
     assert os.path.isfile(out / 'trades.csv')
