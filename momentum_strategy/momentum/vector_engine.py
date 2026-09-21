@@ -23,6 +23,7 @@ import numpy as np
 from .config import BacktestConfig
 from .datasource import DataSource
 from .engine import BacktestEngine
+from .indicators import limit_ratio
 from .panel import Panel, momentum_score_matrix, rsrs_series
 from .timing import SIGNAL_KEEP, timing_signal
 from .universe import build_base_pool
@@ -191,13 +192,23 @@ class VectorBacktestEngine(BacktestEngine):
         self.pool_mask = close_ok & susp_ok & cap_ok & static_ok[None, :]
 
         # --- 候选股可交易性：停牌 + 开盘价有效 ---
-        # 不含跌停判断：跌停要当日收盘价才能确认，而下单在开盘，用它属于未来函数
         open_arr = panel.field('open')
         if open_arr is None:
             open_ok = np.isfinite(close)
         else:
             open_ok = np.isfinite(open_arr) & (open_arr > 0)
         self.tradable = np.isfinite(close) & susp_ok & open_ok
+
+        # 跌停过滤（未来函数，默认关闭，与逐日版的 filter_limit_down 对应）
+        if self.cfg.filter_limit_down:
+            ratios = np.array([limit_ratio(s) for s in panel.stocks])
+            pre_close = panel.field('preClose')
+            if pre_close is None:
+                pre_close = close
+            with np.errstate(invalid='ignore'):
+                limit_down = np.round(pre_close * (1 - ratios[None, :]), 2)
+                not_limit_down = ~((close > 0) & (close <= limit_down))
+            self.tradable = self.tradable & not_limit_down
 
         # --- RSRS ---
         self.rsrs = None

@@ -253,6 +253,11 @@ class StrategyConfig:
     rsrs_index: str = '000300.SH'
     rsrs_enabled: bool = True
 
+    # 候选股跌停过滤。
+    # 注意这是未来函数：下单在当日开盘，而跌停要用当日收盘价才能确认。
+    # 默认关闭；置 True 可复现原脚本的口径，用于对比两种假设下的差别。
+    filter_limit_down: bool = False
+
     # 风控
     stop_loss_ratio: float = -0.15         # 固定硬止损线
 
@@ -1480,8 +1485,9 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
     """
     剔除停牌的候选股；通过则原样返回代码。
 
-    这里不判断跌停：下单发生在当日开盘，而跌停要用当日收盘价才能确认，
-    开盘时它还不存在，拿它过滤属于未来函数。停牌是开盘前就已知的，可以用。
+    跌停过滤由 cfg.filter_limit_down 控制，默认关闭：下单发生在当日开盘，
+    而跌停要用当日收盘价才能确认，开盘时它还不存在，拿它过滤属于未来函数。
+    打开后可复现原脚本的口径。停牌是开盘前就已知的，始终过滤。
     """
     if not stock:
         return None
@@ -1503,6 +1509,14 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
     if not open_price > 0:
         log.info('%s 开盘价异常，跳过', stock)
         return None
+
+    if cfg.filter_limit_down:
+        last_close = float(df['close'].iloc[-1]) if 'close' in df.columns else 0.0
+        pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else last_close
+        limit_down = round(pre_close * (1 - limit_ratio(stock)), 2)
+        if last_close > 0 and last_close <= limit_down:
+            log.info('%s 跌停，收盘:%.2f 跌停价:%.2f', stock, last_close, limit_down)
+            return None
 
     return stock
 
@@ -2082,13 +2096,23 @@ class VectorBacktestEngine(BacktestEngine):
         self.pool_mask = close_ok & susp_ok & cap_ok & static_ok[None, :]
 
         # --- 候选股可交易性：停牌 + 开盘价有效 ---
-        # 不含跌停判断：跌停要当日收盘价才能确认，而下单在开盘，用它属于未来函数
         open_arr = panel.field('open')
         if open_arr is None:
             open_ok = np.isfinite(close)
         else:
             open_ok = np.isfinite(open_arr) & (open_arr > 0)
         self.tradable = np.isfinite(close) & susp_ok & open_ok
+
+        # 跌停过滤（未来函数，默认关闭，与逐日版的 filter_limit_down 对应）
+        if self.cfg.filter_limit_down:
+            ratios = np.array([limit_ratio(s) for s in panel.stocks])
+            pre_close = panel.field('preClose')
+            if pre_close is None:
+                pre_close = close
+            with np.errstate(invalid='ignore'):
+                limit_down = np.round(pre_close * (1 - ratios[None, :]), 2)
+                not_limit_down = ~((close > 0) & (close <= limit_down))
+            self.tradable = self.tradable & not_limit_down
 
         # --- RSRS ---
         self.rsrs = None
@@ -2721,6 +2745,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--min-cap', type=float, default=StrategyConfig.min_market_cap, help='市值下限')
     p.add_argument('--max-cap', type=float, default=StrategyConfig.max_market_cap, help='市值上限')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
+    p.add_argument('--filter-limit-down', action='store_true',
+                   help='过滤当日跌停的候选股。这是未来函数（下单在开盘，跌停要收盘才知道），'
+                        '默认不过滤，打开用于复现原脚本口径')
 
     p.add_argument('--commission', type=float, default=AccountConfig.commission_rate,
                    help='佣金费率，双边，默认 1e-4（万 1）')
@@ -2774,6 +2801,7 @@ def main(argv=None) -> int:
             min_market_cap=args.min_cap,
             max_market_cap=args.max_cap,
             rsrs_enabled=not args.no_rsrs,
+            filter_limit_down=args.filter_limit_down,
         ),
         account=AccountConfig(
             init_cash=args.cash,

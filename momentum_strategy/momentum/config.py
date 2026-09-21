@@ -61,6 +61,11 @@ class StrategyConfig:
     rsrs_index: str = '000300.SH'
     rsrs_enabled: bool = True
 
+    # 候选股跌停过滤。
+    # 注意这是未来函数：下单在当日开盘，而跌停要用当日收盘价才能确认。
+    # 默认关闭；置 True 可复现原脚本的口径，用于对比两种假设下的差别。
+    filter_limit_down: bool = False
+
     # 风控
     stop_loss_ratio: float = -0.15         # 固定硬止损线
 

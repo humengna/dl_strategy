@@ -92,8 +92,9 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
     """
     剔除停牌的候选股；通过则原样返回代码。
 
-    这里不判断跌停：下单发生在当日开盘，而跌停要用当日收盘价才能确认，
-    开盘时它还不存在，拿它过滤属于未来函数。停牌是开盘前就已知的，可以用。
+    跌停过滤由 cfg.filter_limit_down 控制，默认关闭：下单发生在当日开盘，
+    而跌停要用当日收盘价才能确认，开盘时它还不存在，拿它过滤属于未来函数。
+    打开后可复现原脚本的口径。停牌是开盘前就已知的，始终过滤。
     """
     if not stock:
         return None
@@ -115,6 +116,14 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
     if not open_price > 0:
         log.info('%s 开盘价异常，跳过', stock)
         return None
+
+    if cfg.filter_limit_down:
+        last_close = float(df['close'].iloc[-1]) if 'close' in df.columns else 0.0
+        pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else last_close
+        limit_down = round(pre_close * (1 - limit_ratio(stock)), 2)
+        if last_close > 0 and last_close <= limit_down:
+            log.info('%s 跌停，收盘:%.2f 跌停价:%.2f', stock, last_close, limit_down)
+            return None
 
     return stock
 

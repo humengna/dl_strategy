@@ -81,19 +81,42 @@ def test_filter_target_rejects_suspended(source_factory, cfg):
     assert filter_target(source, '600000.SH', dates[-1], cfg) is None
 
 
-def test_filter_target_keeps_stock_that_closes_at_limit_down(source_factory, cfg):
+def test_filter_target_keeps_limit_down_stock_by_default(source_factory, cfg):
     """
-    跌停要当日收盘价才能确认，而下单在开盘。
-    收盘跌停的票在开盘那一刻并不可知，不能拿来过滤。
+    默认不过滤跌停：跌停要当日收盘价才能确认，而下单在开盘，
+    收盘跌停的票在开盘那一刻并不可知。
     """
     dates = make_calendar(2, start='20240102')
     frame = make_frame(dates, [10.0, 9.0], opens=[10.0, 9.9], pre_closes=[10.0, 10.0])
     source = source_factory({'600000.SH': frame})
+    assert cfg.filter_limit_down is False
     assert filter_target(source, '600000.SH', dates[-1], cfg) == '600000.SH'
 
 
-def test_filter_target_ignores_todays_close(source_factory, cfg):
-    """当日收盘价怎么变都不该影响开盘时的过滤结果（未来函数守卫）"""
+def test_filter_target_rejects_limit_down_when_enabled(source_factory):
+    """打开开关后恢复原脚本口径：主板收盘 -10% 视为跌停"""
+    cfg = StrategyConfig(lookback_days=5, filter_limit_down=True)
+    dates = make_calendar(2, start='20240102')
+    frame = make_frame(dates, [10.0, 9.0], opens=[10.0, 9.9], pre_closes=[10.0, 10.0])
+    source = source_factory({'600000.SH': frame})
+    assert filter_target(source, '600000.SH', dates[-1], cfg) is None
+
+
+def test_filter_limit_down_uses_board_specific_ratio(source_factory):
+    """创业板跌停是 20%，跌 10% 不算跌停"""
+    cfg = StrategyConfig(lookback_days=5, filter_limit_down=True)
+    dates = make_calendar(2, start='20240102')
+    frame = make_frame(dates, [10.0, 9.0], opens=[10.0, 9.9], pre_closes=[10.0, 10.0])
+    source = source_factory({'300750.SZ': frame})
+    assert filter_target(source, '300750.SZ', dates[-1], cfg) == '300750.SZ'
+
+    deep = make_frame(dates, [10.0, 8.0], opens=[10.0, 9.9], pre_closes=[10.0, 10.0])
+    source = source_factory({'300750.SZ': deep})
+    assert filter_target(source, '300750.SZ', dates[-1], cfg) is None
+
+
+def test_filter_target_ignores_todays_close_by_default(source_factory, cfg):
+    """默认口径下，当日收盘价怎么变都不该影响过滤结果（未来函数守卫）"""
     dates = make_calendar(2, start='20240102')
 
     def build(last_close):

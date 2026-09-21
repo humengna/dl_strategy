@@ -45,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--min-cap', type=float, default=StrategyConfig.min_market_cap, help='市值下限')
     p.add_argument('--max-cap', type=float, default=StrategyConfig.max_market_cap, help='市值上限')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
+    p.add_argument('--filter-limit-down', action='store_true',
+                   help='过滤当日跌停的候选股。这是未来函数（下单在开盘，跌停要收盘才知道），'
+                        '默认不过滤，打开用于复现原脚本口径')
 
     p.add_argument('--commission', type=float, default=AccountConfig.commission_rate,
                    help='佣金费率，双边，默认 1e-4（万 1）')
@@ -101,6 +104,7 @@ def main(argv=None) -> int:
             min_market_cap=args.min_cap,
             max_market_cap=args.max_cap,
             rsrs_enabled=not args.no_rsrs,
+            filter_limit_down=args.filter_limit_down,
         ),
         account=AccountConfig(
             init_cash=args.cash,
