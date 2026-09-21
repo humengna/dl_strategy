@@ -55,12 +55,19 @@ pip install -r requirements-dev.txt    # 加 pytest
 ```bash
 # 真实数据（Windows + QMT）
 python run_backtest.py --start 20240101 --end 20241231 --cash 200000
-python run_backtest.py --start 20240101 --end 20241231 --download     # 先补下载日线
+python run_backtest.py --start 20240101 --end 20241231 --download     # 先补下载日线（带进度条）
 python run_backtest.py --start 20240101 --end 20241231 --equity-csv equity.csv --deals-csv deals.csv
 
 # 离线试跑（任何平台，不需要 QMT）
 python tools/make_sample_data.py --out data/sample --days 700
 python run_backtest.py --source csv --data-dir data/sample --start 20240102 --end 20240630
+```
+
+下载和预加载都带进度条，终端里原地刷新，输出重定向到文件时按 10% 一档换行打印：
+
+```
+[数据] 开始下载日线: 5224 只，20240101 ~ 20241231
+[数据] 下载 [#########---------------]  40.0% 2090/5224 已用 03:12 剩余 04:47 600519.SH
 ```
 
 数据自检（取不到数据时先跑这个）：
@@ -90,6 +97,7 @@ momentum_strategy/
 │   ├── report.py       # 绩效统计与 csv 输出
 │   ├── sample_data.py  # 合成样例行情
 │   ├── diagnostics.py  # xtdata 数据自检
+│   ├── progress.py     # 终端进度条
 │   └── cli.py          # 命令行入口
 ├── tools/make_sample_data.py
 ├── tests/              # pytest，不依赖 QMT
@@ -105,10 +113,10 @@ momentum_strategy/
 python -m pytest
 ```
 
-75 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
+91 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
 「当日 K 线不参与打分」的未来函数检查）、股票池过滤、择时信号、T+1 与费用、
 调仓与止损、绩效统计，以及 xtdata 取数行为（分批、字段退回、无数据报错，
-用桩 xtquant 注入，不需要 QMT）。
+用桩 xtquant 注入，不需要 QMT），以及进度条渲染。
 
 ## 与原 QMT 脚本的差异
 

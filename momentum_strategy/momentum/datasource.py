@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 import pandas as pd
 
 from .config import DAILY_FIELDS
+from .progress import Progress
 
 # 单次 get_market_data_ex 的标的数量上限。一次性请求几千只容易超时或静默返回空表。
 PRELOAD_CHUNK_SIZE = 300
@@ -189,7 +190,7 @@ class XtDataSource(DataSource):
                 return True
         return False
 
-    def preload(self, stocks, start_date, end_date):
+    def preload(self, stocks, start_date, end_date, show_progress: bool = True):
         if not self.use_cache or not stocks:
             return
 
@@ -201,7 +202,11 @@ class XtDataSource(DataSource):
             return
 
         loaded = 0
+        processed = 0
         total_chunks = (len(stocks) + PRELOAD_CHUNK_SIZE - 1) // PRELOAD_CHUNK_SIZE
+        bar = Progress(len(stocks), prefix='[数据] 预加载',
+                       enabled=show_progress and total_chunks > 1)
+
         for idx in range(total_chunks):
             chunk = stocks[idx * PRELOAD_CHUNK_SIZE:(idx + 1) * PRELOAD_CHUNK_SIZE]
             data = self._raw_fetch(self.fields, chunk, start_date, end_date)
@@ -213,8 +218,9 @@ class XtDataSource(DataSource):
                 df.index = [str(i)[:8] for i in df.index]
                 self._cache[stock] = df
                 loaded += 1
-            if total_chunks > 1 and (idx + 1) % 5 == 0:
-                print(f'[数据] 预加载进度 {idx + 1}/{total_chunks} 批，已加载 {loaded} 只')
+            processed += len(chunk)
+            bar.update(processed, suffix=f'已加载 {loaded} 只')
+        bar.close()
 
         print(f'[数据] 预加载完成，{loaded} 只有数据')
         if loaded == 0:
@@ -263,19 +269,66 @@ class XtDataSource(DataSource):
         self._detail_cache[stock] = detail
         return detail
 
-    def download(self, stocks, start_date, end_date):
-        stocks = list(stocks)
-        print(f'[数据] 补下载日线: {len(stocks)} 只 ...')
-        try:
-            self._xtdata.download_history_data2(stocks, period='1d',
-                                                start_time=start_date, end_time=end_date)
-        except AttributeError:
-            for i, stock in enumerate(stocks, 1):
+    def download(self, stocks, start_date, end_date, show_progress: bool = True):
+        """
+        补下载本地日线，带进度显示。
+
+        优先用 download_history_data2 + callback（xtdata 会实时回调下载进度）；
+        该接口或 callback 参数不可用时，退回逐只下载并自己统计进度。
+        """
+        stocks = list(dict.fromkeys(stocks))
+        if not stocks:
+            return
+
+        print(f'[数据] 开始下载日线: {len(stocks)} 只，{start_date} ~ {end_date}')
+        bar = Progress(len(stocks), prefix='[数据] 下载', enabled=show_progress)
+
+        def _callback(data):
+            """xtdata 回调，data 形如 {'finished': n, 'total': m, 'stockcode': '600000.SH'}"""
+            try:
+                total = int(data.get('total') or 0)
+                finished = int(data.get('finished') or 0)
+            except (AttributeError, TypeError, ValueError):
+                return
+            if total > 0:
+                bar.total = total
+            bar.update(finished, suffix=str(data.get('stockcode') or ''))
+
+        batch = getattr(self._xtdata, 'download_history_data2', None)
+        if batch is not None:
+            try:
+                batch(stocks, period='1d', start_time=start_date,
+                      end_time=end_date, callback=_callback)
+                bar.close()
+                print('[数据] 下载完成')
+                return
+            except TypeError:
+                # 该版本的 download_history_data2 不接受 callback
+                try:
+                    batch(stocks, period='1d', start_time=start_date, end_time=end_date)
+                    bar.update(len(stocks))
+                    bar.close()
+                    print('[数据] 下载完成（该版本不支持进度回调）')
+                    return
+                except Exception as e:
+                    print(f'[数据] 批量下载失败，改为逐只下载: {e}')
+            except Exception as e:
+                print(f'[数据] 批量下载失败，改为逐只下载: {e}')
+
+        failed = []
+        for i, stock in enumerate(stocks, 1):
+            try:
                 self._xtdata.download_history_data(stock, period='1d',
                                                    start_time=start_date, end_time=end_date)
-                if i % 200 == 0:
-                    print(f'[数据] 下载进度 {i}/{len(stocks)}')
-        print('[数据] 下载完成')
+            except Exception as e:
+                failed.append((stock, str(e)))
+            bar.update(i, suffix=stock)
+        bar.close()
+
+        if failed:
+            print(f'[数据] 下载完成，{len(failed)} 只失败，例如 {failed[:3]}')
+        else:
+            print('[数据] 下载完成')
 
 
 class CsvDataSource(DataSource):

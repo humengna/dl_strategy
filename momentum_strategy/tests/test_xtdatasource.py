@@ -20,7 +20,8 @@ class FakeXtdata:
     """
 
     def __init__(self, stocks, days=30, supports_suspend_flag=True,
-                 has_local_data=True, max_batch=None):
+                 has_local_data=True, max_batch=None,
+                 batch_download=False, batch_callback=True):
         self.stocks = list(stocks)
         self.dates = pd.bdate_range('20240102', periods=days).strftime('%Y%m%d').tolist()
         self.supports_suspend_flag = supports_suspend_flag
@@ -28,6 +29,9 @@ class FakeXtdata:
         self.max_batch = max_batch
         self.calls = []
         self.downloaded = []
+        if batch_download:
+            self.download_history_data2 = (self._batch_with_callback if batch_callback
+                                           else self._batch_without_callback)
 
     # --- 被 XtDataSource 调用的接口 ---
 
@@ -72,6 +76,18 @@ class FakeXtdata:
 
     def download_history_data(self, stock, period='1d', start_time='', end_time=''):
         self.downloaded.append(stock)
+
+    def _batch_with_callback(self, stock_list, period='1d', start_time='',
+                             end_time='', callback=None, incrementally=None):
+        total = len(stock_list)
+        for i, stock in enumerate(stock_list, 1):
+            self.downloaded.append(stock)
+            if callback is not None:
+                callback({'finished': i, 'total': total, 'stockcode': stock, 'message': ''})
+
+    def _batch_without_callback(self, stock_list, period='1d', start_time='', end_time=''):
+        # 旧版本签名里没有 callback，传了就抛 TypeError
+        self.downloaded.extend(stock_list)
 
 
 @pytest.fixture
@@ -173,3 +189,84 @@ def test_download_falls_back_to_single_stock_api(make_xt):
     # 桩没有 download_history_data2，应退回逐只下载
     source.download(['600000.SH', '000001.SZ'], '20240102', '20240229')
     assert fake.downloaded == ['600000.SH', '000001.SZ']
+
+
+# ---------------- 下载进度 ----------------
+
+def test_download_reports_progress_via_callback(make_xt, capsys):
+    stocks = [f'{600000 + i}.SH' for i in range(20)]
+    source, fake = make_xt(stocks=stocks, batch_download=True)
+
+    source.download(stocks, '20240102', '20240229')
+
+    out = capsys.readouterr().out
+    assert '开始下载日线: 20 只' in out
+    assert '[数据] 下载' in out
+    assert '100.0%' in out
+    assert '20/20' in out
+    assert '下载完成' in out
+    assert fake.downloaded == stocks
+
+
+def test_download_falls_back_when_callback_unsupported(make_xt, capsys):
+    stocks = ['600000.SH', '000001.SZ']
+    source, fake = make_xt(stocks=stocks, batch_download=True, batch_callback=False)
+
+    source.download(stocks, '20240102', '20240229')
+
+    out = capsys.readouterr().out
+    assert '不支持进度回调' in out
+    assert fake.downloaded == stocks
+
+
+def test_download_progress_on_per_stock_fallback(make_xt, capsys):
+    stocks = [f'{600000 + i}.SH' for i in range(12)]
+    source, fake = make_xt(stocks=stocks)          # 桩没有 download_history_data2
+
+    source.download(stocks, '20240102', '20240229')
+
+    out = capsys.readouterr().out
+    assert '100.0%' in out and '12/12' in out
+    assert fake.downloaded == stocks
+
+
+def test_download_survives_single_stock_failure(make_xt, capsys):
+    stocks = ['600000.SH', 'BAD.SH', '000001.SZ']
+    source, fake = make_xt(stocks=stocks)
+
+    original = fake.download_history_data
+
+    def flaky(stock, **kwargs):
+        if stock == 'BAD.SH':
+            raise RuntimeError('no such stock')
+        original(stock, **kwargs)
+
+    fake.download_history_data = flaky
+    source.download(stocks, '20240102', '20240229')
+
+    out = capsys.readouterr().out
+    assert '1 只失败' in out
+    assert fake.downloaded == ['600000.SH', '000001.SZ']
+
+
+def test_download_progress_can_be_disabled(make_xt, capsys):
+    stocks = [f'{600000 + i}.SH' for i in range(5)]
+    source, fake = make_xt(stocks=stocks)
+
+    source.download(stocks, '20240102', '20240229', show_progress=False)
+
+    out = capsys.readouterr().out
+    assert '%' not in out
+    assert '下载完成' in out
+
+
+def test_preload_shows_progress_for_large_pool(make_xt, capsys):
+    stocks = [f'{600000 + i}.SH' for i in range(PRELOAD_CHUNK_SIZE + 50)]
+    source, fake = make_xt(stocks=stocks)
+
+    source.preload(stocks, '20240102', '20240229')
+
+    out = capsys.readouterr().out
+    assert '[数据] 预加载' in out
+    assert '100.0%' in out
+    assert f'{len(stocks)}/{len(stocks)}' in out
