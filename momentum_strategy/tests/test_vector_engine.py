@@ -140,3 +140,38 @@ def test_panel_source_falls_back_for_unknown_stock():
 
     df = engine.source.get_one('000300.SH', all_days[40], 5)
     assert df is not None and len(df) == 5
+
+
+def test_tradable_matrix_ignores_limit_down_close(source_factory):
+    """向量引擎的可交易矩阵同样不能用当日收盘价判断跌停"""
+    from momentum.sample_data import make_calendar
+    from tests.conftest import make_frame
+
+    dates = make_calendar(30, start='20240102')
+    closes = [10.0] * 29 + [8.5]          # 最后一天收盘跌停（主板 -15%）
+    opens = [10.0] * 30
+    pre = [10.0] * 30
+    source = source_factory({'600000.SH': make_frame(dates, closes, opens=opens,
+                                                     pre_closes=pre)})
+    engine = build(VectorBacktestEngine, source, dates[20], dates[-1])
+    engine.prepare()
+
+    i = engine.panel.date_pos[dates[-1]]
+    j = engine.panel.stock_pos['600000.SH']
+    assert bool(engine.tradable[i, j]) is True
+
+
+def test_tradable_matrix_excludes_suspended(source_factory):
+    from momentum.sample_data import make_calendar
+    from tests.conftest import make_frame
+
+    dates = make_calendar(30, start='20240102')
+    suspend = [0] * 29 + [1]
+    source = source_factory({'600000.SH': make_frame(dates, [10.0] * 30,
+                                                     suspend=suspend)})
+    engine = build(VectorBacktestEngine, source, dates[20], dates[-1])
+    engine.prepare()
+
+    i = engine.panel.date_pos[dates[-1]]
+    j = engine.panel.stock_pos['600000.SH']
+    assert bool(engine.tradable[i, j]) is False

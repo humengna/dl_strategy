@@ -89,7 +89,12 @@ def momentum_series(source: DataSource, stock: str, date: str,
 
 def filter_target(source: DataSource, stock: Optional[str], date: str,
                   cfg: StrategyConfig) -> Optional[str]:
-    """剔除停牌、跌停的候选股；通过则原样返回代码"""
+    """
+    剔除停牌的候选股；通过则原样返回代码。
+
+    这里不判断跌停：下单发生在当日开盘，而跌停要用当日收盘价才能确认，
+    开盘时它还不存在，拿它过滤属于未来函数。停牌是开盘前就已知的，可以用。
+    """
     if not stock:
         return None
 
@@ -105,15 +110,10 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
         except (TypeError, ValueError):
             pass
 
-    last_close = float(df['close'].iloc[-1])
-    if last_close <= 0:
-        return None
-
-    pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else last_close
-    ratio = limit_ratio(stock) if cfg.dynamic_limit_down else 0.10
-    limit_down = round(pre_close * (1 - ratio), 2)
-    if last_close <= limit_down:
-        log.info('%s 跌停，收盘:%.2f 跌停价:%.2f', stock, last_close, limit_down)
+    # 数据有效性用开盘价判断：它既是成交价，也是开盘时点就已知的值
+    open_price = float(df['open'].iloc[-1]) if 'open' in df.columns else 0.0
+    if not open_price > 0:
+        log.info('%s 开盘价异常，跳过', stock)
         return None
 
     return stock

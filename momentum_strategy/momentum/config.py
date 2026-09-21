@@ -67,9 +67,6 @@ class StrategyConfig:
     # 预热：原脚本 bar_count < LOOKBACK_DAYS + 10 时不交易
     warmup_days: int = 0                   # 0 表示按 lookback_days + 10 自动计算
 
-    # 跌停判断：True 按代码前缀区分 10%/20%；False 沿用原脚本固定 10%
-    dynamic_limit_down: bool = True
-
     def __post_init__(self):
         if self.warmup_days <= 0:
             self.warmup_days = self.lookback_days + 10

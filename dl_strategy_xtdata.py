@@ -259,9 +259,6 @@ class StrategyConfig:
     # 预热：原脚本 bar_count < LOOKBACK_DAYS + 10 时不交易
     warmup_days: int = 0                   # 0 表示按 lookback_days + 10 自动计算
 
-    # 跌停判断：True 按代码前缀区分 10%/20%；False 沿用原脚本固定 10%
-    dynamic_limit_down: bool = True
-
     def __post_init__(self):
         if self.warmup_days <= 0:
             self.warmup_days = self.lookback_days + 10
@@ -1446,7 +1443,12 @@ def momentum_series(source: DataSource, stock: str, date: str,
 
 def filter_target(source: DataSource, stock: Optional[str], date: str,
                   cfg: StrategyConfig) -> Optional[str]:
-    """剔除停牌、跌停的候选股；通过则原样返回代码"""
+    """
+    剔除停牌的候选股；通过则原样返回代码。
+
+    这里不判断跌停：下单发生在当日开盘，而跌停要用当日收盘价才能确认，
+    开盘时它还不存在，拿它过滤属于未来函数。停牌是开盘前就已知的，可以用。
+    """
     if not stock:
         return None
 
@@ -1462,15 +1464,10 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
         except (TypeError, ValueError):
             pass
 
-    last_close = float(df['close'].iloc[-1])
-    if last_close <= 0:
-        return None
-
-    pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else last_close
-    ratio = limit_ratio(stock) if cfg.dynamic_limit_down else 0.10
-    limit_down = round(pre_close * (1 - ratio), 2)
-    if last_close <= limit_down:
-        log.info('%s 跌停，收盘:%.2f 跌停价:%.2f', stock, last_close, limit_down)
+    # 数据有效性用开盘价判断：它既是成交价，也是开盘时点就已知的值
+    open_price = float(df['open'].iloc[-1]) if 'open' in df.columns else 0.0
+    if not open_price > 0:
+        log.info('%s 开盘价异常，跳过', stock)
         return None
 
     return stock
@@ -2050,16 +2047,14 @@ class VectorBacktestEngine(BacktestEngine):
 
         self.pool_mask = close_ok & susp_ok & cap_ok & static_ok[None, :]
 
-        # --- 跌停过滤（候选股用） ---
-        ratios = np.array([limit_ratio(s) if self.cfg.dynamic_limit_down else 0.10
-                           for s in panel.stocks])
-        pre_close = panel.field('preClose')
-        if pre_close is None:
-            pre_close = close
-        with np.errstate(invalid='ignore'):
-            limit_down = np.round(pre_close * (1 - ratios[None, :]), 2)
-            not_limit_down = ~(close <= limit_down)
-        self.tradable = close_ok & susp_ok & not_limit_down
+        # --- 候选股可交易性：停牌 + 开盘价有效 ---
+        # 不含跌停判断：跌停要当日收盘价才能确认，而下单在开盘，用它属于未来函数
+        open_arr = panel.field('open')
+        if open_arr is None:
+            open_ok = np.isfinite(close)
+        else:
+            open_ok = np.isfinite(open_arr) & (open_arr > 0)
+        self.tradable = np.isfinite(close) & susp_ok & open_ok
 
         # --- RSRS ---
         self.rsrs = None

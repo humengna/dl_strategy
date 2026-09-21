@@ -81,22 +81,36 @@ def test_filter_target_rejects_suspended(source_factory, cfg):
     assert filter_target(source, '600000.SH', dates[-1], cfg) is None
 
 
-def test_filter_target_rejects_limit_down_main_board(source_factory, cfg):
+def test_filter_target_keeps_stock_that_closes_at_limit_down(source_factory, cfg):
+    """
+    跌停要当日收盘价才能确认，而下单在开盘。
+    收盘跌停的票在开盘那一刻并不可知，不能拿来过滤。
+    """
     dates = make_calendar(2, start='20240102')
-    frame = make_frame(dates, [10.0, 9.0], pre_closes=[10.0, 10.0])
+    frame = make_frame(dates, [10.0, 9.0], opens=[10.0, 9.9], pre_closes=[10.0, 10.0])
+    source = source_factory({'600000.SH': frame})
+    assert filter_target(source, '600000.SH', dates[-1], cfg) == '600000.SH'
+
+
+def test_filter_target_ignores_todays_close(source_factory, cfg):
+    """当日收盘价怎么变都不该影响开盘时的过滤结果（未来函数守卫）"""
+    dates = make_calendar(2, start='20240102')
+
+    def build(last_close):
+        frame = make_frame(dates, [10.0, last_close], opens=[10.0, 10.0],
+                           pre_closes=[10.0, 10.0])
+        return source_factory({'600000.SH': frame})
+
+    results = {filter_target(build(c), '600000.SH', dates[-1], cfg)
+               for c in (5.0, 9.0, 10.0, 11.0, 20.0)}
+    assert results == {'600000.SH'}
+
+
+def test_filter_target_rejects_invalid_open(source_factory, cfg):
+    dates = make_calendar(2, start='20240102')
+    frame = make_frame(dates, [10.0, 10.0], opens=[10.0, 0.0], pre_closes=[10.0, 10.0])
     source = source_factory({'600000.SH': frame})
     assert filter_target(source, '600000.SH', dates[-1], cfg) is None
-
-
-def test_filter_target_keeps_gem_stock_down_ten_percent(source_factory, cfg):
-    """创业板跌停是 20%，跌 10% 不应被当成跌停剔除"""
-    dates = make_calendar(2, start='20240102')
-    frame = make_frame(dates, [10.0, 9.0], pre_closes=[10.0, 10.0])
-    source = source_factory({'300750.SZ': frame})
-    assert filter_target(source, '300750.SZ', dates[-1], cfg) == '300750.SZ'
-
-    legacy = StrategyConfig(lookback_days=5, dynamic_limit_down=False)
-    assert filter_target(source, '300750.SZ', dates[-1], legacy) is None
 
 
 def test_filter_target_none_for_unknown_stock(source_factory, cfg):
