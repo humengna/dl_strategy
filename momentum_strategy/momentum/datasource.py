@@ -1,0 +1,306 @@
+# coding: utf-8
+"""
+行情数据源。
+
+DataSource 定义策略需要的最小接口，策略层只依赖这个接口：
+  - XtDataSource  : 生产环境，走 xtquant.xtdata（需要本机 QMT / 投研端在线）
+  - CsvDataSource : 离线环境，从 csv 目录读数据，用于单元测试和无 QMT 时试跑
+
+约定：
+  - 日期一律用 'YYYYMMDD' 字符串
+  - get_bars 返回 {stock: DataFrame}，DataFrame 按日期升序，index 为日期字符串
+  - 查询区间是「截至 end_date（含）的最后 count 根」
+"""
+
+import json
+import os
+from typing import Dict, Iterable, List, Optional, Sequence
+
+import pandas as pd
+
+from .config import DAILY_FIELDS
+
+
+class DataSource(object):
+    """数据源接口"""
+
+    def get_sector_stocks(self, sector: str) -> List[str]:
+        raise NotImplementedError
+
+    def get_trading_dates(self, end_date: str) -> List[str]:
+        """返回截至 end_date 的全部交易日（升序）"""
+        raise NotImplementedError
+
+    def get_bars(self, stocks: Sequence[str], end_date: str, count: int,
+                 fields: Optional[Sequence[str]] = None) -> Dict[str, pd.DataFrame]:
+        raise NotImplementedError
+
+    def get_detail(self, stock: str) -> Optional[dict]:
+        raise NotImplementedError
+
+    def preload(self, stocks: Sequence[str], start_date: str, end_date: str) -> None:
+        """可选：批量预加载到内存"""
+        return None
+
+    def download(self, stocks: Sequence[str], start_date: str, end_date: str) -> None:
+        """可选：补下载本地数据"""
+        return None
+
+    # ---------- 基于 get_bars / get_detail 的通用便捷方法 ----------
+
+    def get_one(self, stock: str, end_date: str, count: int,
+                fields: Optional[Sequence[str]] = None) -> Optional[pd.DataFrame]:
+        df = self.get_bars([stock], end_date, count, fields).get(stock)
+        if df is None or len(df) == 0:
+            return None
+        return df
+
+    def get_stock_name(self, stock: str) -> str:
+        detail = self.get_detail(stock)
+        if not detail:
+            return ''
+        return detail.get('InstrumentName', '') or ''
+
+    def get_market_cap(self, stock: str, last_close: float = 0.0) -> float:
+        """
+        总市值。优先取 TotalValue；缺失时用总股本 × 最新收盘价估算。
+        不同 QMT 版本总股本字段名不一致，依次尝试。
+        """
+        detail = self.get_detail(stock)
+        if not detail:
+            return 0.0
+
+        total_value = detail.get('TotalValue', 0) or 0
+        if total_value > 0:
+            return float(total_value)
+
+        for key in ('TotalVolume', 'TotalVolumn', 'TotalShares'):
+            shares = detail.get(key, 0) or 0
+            if shares > 0 and last_close > 0:
+                return float(shares) * float(last_close)
+        return 0.0
+
+
+def _normalize(df: pd.DataFrame, end_date: str, count: int) -> pd.DataFrame:
+    """index 统一成日期字符串，按 end_date 截断并取最后 count 根"""
+    out = df.copy()
+    out.index = [str(i)[:8] for i in out.index]
+    out = out.loc[out.index <= end_date]
+    if count and count > 0:
+        out = out.tail(count)
+    return out
+
+
+class XtDataSource(DataSource):
+    """
+    xtquant.xtdata 数据源。
+
+    use_cache=True 时 preload 会把整个回测区间的日线一次性读进内存，
+    之后按日期切片，避免逐个交易日对全市场重复调用 get_market_data_ex。
+    缓存未命中的标的会自动回落到实时查询。
+    """
+
+    def __init__(self, use_cache: bool = True, market: str = 'SH'):
+        from xtquant import xtdata  # 延迟导入：没有 QMT 的机器也能 import 本模块
+
+        self._xtdata = xtdata
+        self.use_cache = use_cache
+        self.market = market
+        self._cache: Dict[str, pd.DataFrame] = {}
+        self._detail_cache: Dict[str, Optional[dict]] = {}
+
+    # ---------- 板块 / 日历 ----------
+
+    def get_sector_stocks(self, sector: str) -> List[str]:
+        try:
+            return list(self._xtdata.get_stock_list_in_sector(sector) or [])
+        except Exception as e:
+            print(f'[数据] 板块 {sector} 获取失败: {e}')
+            return []
+
+    def get_trading_dates(self, end_date: str) -> List[str]:
+        timetags = self._xtdata.get_trading_dates(self.market, start_time='',
+                                                  end_time=end_date, count=-1)
+        days = [self._xtdata.timetag_to_datetime(t, '%Y%m%d') for t in timetags]
+        return [d for d in days if d <= end_date]
+
+    # ---------- 行情 ----------
+
+    def preload(self, stocks, start_date, end_date):
+        if not self.use_cache or not stocks:
+            return
+        stocks = list(dict.fromkeys(stocks))
+        print(f'[数据] 预加载 {len(stocks)} 只标的 {start_date} ~ {end_date} ...')
+        data = self._xtdata.get_market_data_ex(
+            list(DAILY_FIELDS), stocks,
+            period='1d',
+            start_time=start_date,
+            end_time=end_date,
+            dividend_type='none',
+            fill_data=True,
+        )
+        loaded = 0
+        for stock in stocks:
+            df = data.get(stock)
+            if df is None or len(df) == 0:
+                continue
+            df = df.copy()
+            df.index = [str(i)[:8] for i in df.index]
+            self._cache[stock] = df
+            loaded += 1
+        print(f'[数据] 预加载完成，{loaded} 只有数据')
+
+    def get_bars(self, stocks, end_date, count, fields=None):
+        if isinstance(stocks, str):
+            stocks = [stocks]
+        fields = list(fields or DAILY_FIELDS)
+
+        result: Dict[str, pd.DataFrame] = {}
+        missing: List[str] = []
+
+        if self.use_cache:
+            for stock in stocks:
+                cached = self._cache.get(stock)
+                if cached is None:
+                    missing.append(stock)
+                    continue
+                sub = _normalize(cached, end_date, count)
+                if len(sub) > 0:
+                    result[stock] = sub
+            if not missing:
+                return result
+        else:
+            missing = list(stocks)
+
+        try:
+            data = self._xtdata.get_market_data_ex(
+                fields, missing,
+                period='1d',
+                end_time=end_date,
+                count=count,
+                dividend_type='none',
+                fill_data=True,
+            )
+        except Exception as e:
+            print(f'[数据] get_market_data_ex 失败: {e}')
+            return result
+
+        for stock in missing:
+            df = data.get(stock)
+            if df is None or len(df) == 0:
+                continue
+            result[stock] = _normalize(df, end_date, count)
+        return result
+
+    # ---------- 合约信息 ----------
+
+    def get_detail(self, stock):
+        if stock in self._detail_cache:
+            return self._detail_cache[stock]
+        try:
+            detail = self._xtdata.get_instrument_detail(stock)
+        except Exception:
+            detail = None
+        self._detail_cache[stock] = detail
+        return detail
+
+    def download(self, stocks, start_date, end_date):
+        stocks = list(stocks)
+        print(f'[数据] 补下载日线: {len(stocks)} 只 ...')
+        try:
+            self._xtdata.download_history_data2(stocks, period='1d',
+                                                start_time=start_date, end_time=end_date)
+        except AttributeError:
+            for i, stock in enumerate(stocks, 1):
+                self._xtdata.download_history_data(stock, period='1d',
+                                                   start_time=start_date, end_time=end_date)
+                if i % 200 == 0:
+                    print(f'[数据] 下载进度 {i}/{len(stocks)}')
+        print('[数据] 下载完成')
+
+
+class CsvDataSource(DataSource):
+    """
+    离线 csv 数据源，目录结构：
+
+        data_dir/
+          bars/600000.SH.csv        # 列：date,open,high,low,close,preClose,volume,suspendFlag
+          instruments.json          # {"600000.SH": {"InstrumentName": "浦发银行", "TotalValue": 3.2e10}}
+          sectors.json              # {"沪深A股": ["600000.SH", ...]}
+
+    用于单元测试，以及没有 QMT 环境时用自备数据跑通流程。
+    """
+
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        self._cache: Dict[str, pd.DataFrame] = {}
+        self._details: Dict[str, dict] = {}
+        self._sectors: Dict[str, List[str]] = {}
+        self._load()
+
+    def _load(self):
+        bars_dir = os.path.join(self.data_dir, 'bars')
+        if os.path.isdir(bars_dir):
+            for name in sorted(os.listdir(bars_dir)):
+                if not name.endswith('.csv'):
+                    continue
+                stock = name[:-4]
+                df = pd.read_csv(os.path.join(bars_dir, name), dtype={'date': str})
+                df = df.set_index('date').sort_index()
+                df.index = [str(i)[:8] for i in df.index]
+                self._cache[stock] = df
+
+        detail_path = os.path.join(self.data_dir, 'instruments.json')
+        if os.path.isfile(detail_path):
+            with open(detail_path, encoding='utf-8') as f:
+                self._details = json.load(f)
+
+        sector_path = os.path.join(self.data_dir, 'sectors.json')
+        if os.path.isfile(sector_path):
+            with open(sector_path, encoding='utf-8') as f:
+                self._sectors = json.load(f)
+
+    # ---------- 接口实现 ----------
+
+    def get_sector_stocks(self, sector):
+        return list(self._sectors.get(sector, []))
+
+    def get_trading_dates(self, end_date):
+        days = set()
+        for df in self._cache.values():
+            days.update(df.index)
+        return sorted(d for d in days if d <= end_date)
+
+    def get_bars(self, stocks, end_date, count, fields=None):
+        if isinstance(stocks, str):
+            stocks = [stocks]
+        result = {}
+        for stock in stocks:
+            df = self._cache.get(stock)
+            if df is None:
+                continue
+            sub = _normalize(df, end_date, count)
+            if len(sub) > 0:
+                result[stock] = sub
+        return result
+
+    def get_detail(self, stock):
+        return self._details.get(stock)
+
+    # ---------- 供测试构造数据 ----------
+
+    @classmethod
+    def from_frames(cls, frames: Dict[str, pd.DataFrame],
+                    details: Optional[Dict[str, dict]] = None,
+                    sectors: Optional[Dict[str, Iterable[str]]] = None) -> 'CsvDataSource':
+        """直接用内存中的 DataFrame 构造数据源，不读磁盘"""
+        obj = cls.__new__(cls)
+        obj.data_dir = ''
+        obj._cache = {}
+        for stock, df in frames.items():
+            d = df.copy()
+            d.index = [str(i)[:8] for i in d.index]
+            obj._cache[stock] = d.sort_index()
+        obj._details = dict(details or {})
+        obj._sectors = {k: list(v) for k, v in (sectors or {}).items()}
+        return obj

@@ -1,0 +1,3 @@
+numpy>=1.21
+pandas>=1.3
+# xtquant 随迅投 QMT / 投研端安装，不从 PyPI 获取

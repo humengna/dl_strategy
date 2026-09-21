@@ -1,6 +1,15 @@
 # dl_strategy
 
-动量择时 A 股策略的 **xtdata 版**（`dl_strategy_xtdata.py`）。
+动量择时 A 股策略，两种形态：
+
+| 目录 / 文件 | 说明 |
+|---|---|
+| [`momentum_strategy/`](momentum_strategy/) | **推荐**。分层的独立项目：配置 / 指标 / 数据源 / 选股 / 择时 / 撮合 / 引擎 / 统计分离，带 67 个单元测试，可用合成数据离线跑通 |
+| `dl_strategy_xtdata.py` | 单文件版，逻辑相同，适合直接丢进 QMT 目录或快速改参数 |
+
+两者逻辑和参数一致，都源自 QMT 回测脚本 `dl_strategy.py`。
+
+## 单文件版（`dl_strategy_xtdata.py`）
 
 原版跑在 QMT 客户端内置回测里（`init` / `handlebar` / `passorder`），本版改成
 可以直接 `python` 运行的独立脚本：行情走 `xtquant.xtdata`，交易由脚本内的
@@ -28,3 +37,20 @@ python dl_strategy_xtdata.py --start 20240101 --end 20241231 --no-cache   # 关�
 4. 跌停 / 停牌过滤
 5. 择时：动量分数连续下降 ≥ 2 天 → SELL，否则 BUY/KEEP（RSRS 仅打印不参与决策）
 6. 调仓（按当日开盘价成交），收盘价检查 -15% 硬止损
+
+## 项目版（`momentum_strategy/`）
+
+```bash
+cd momentum_strategy
+pip install -r requirements-dev.txt
+python -m pytest                                      # 67 个用例，不需要 QMT
+
+# 离线试跑（任何平台）
+python tools/make_sample_data.py --out data/sample --days 700
+python run_backtest.py --source csv --data-dir data/sample --start 20240102 --end 20240630
+
+# 真实数据（Windows + QMT）
+python run_backtest.py --start 20240101 --end 20241231 --cash 200000
+```
+
+详见 [momentum_strategy/README.md](momentum_strategy/README.md)。
