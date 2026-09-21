@@ -119,11 +119,11 @@ def check_xtdata(samples: Sequence[str] = DEFAULT_SAMPLES,
 def _probe_bars(xtdata, stocks: Sequence[str], mode: str,
                 start_date: str = '', end_date: str = '') -> bool:
     """分别用完整字段和核心字段探测，打印返回形状"""
-    from .datasource import CORE_FIELDS
     from .config import DAILY_FIELDS
+    from .datasource import CORE_FIELDS, DEFAULT_DIVIDEND_TYPE
 
     for label, fields in (('完整字段', DAILY_FIELDS), ('核心字段', CORE_FIELDS)):
-        kwargs = dict(period='1d', dividend_type='none', fill_data=True)
+        kwargs = dict(period='1d', dividend_type=DEFAULT_DIVIDEND_TYPE, fill_data=True)
         if mode == 'count':
             kwargs.update(count=5)
             desc = f'count=5 / {label}'

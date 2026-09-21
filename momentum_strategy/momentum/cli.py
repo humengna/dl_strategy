@@ -12,6 +12,7 @@ from datetime import datetime
 
 from .config import (CONCEPT_SECTORS_DEFAULT, AccountConfig, BacktestConfig,
                      StrategyConfig)
+from .datasource import DEFAULT_DIVIDEND_TYPE, DIVIDEND_TYPES
 from .engine import BacktestEngine
 from .report import evaluate, format_report, save_csv, save_results
 from .vector_engine import VectorBacktestEngine
@@ -34,6 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--source', choices=['xtdata', 'csv'], default='xtdata', help='数据源')
     p.add_argument('--data-dir', default='', help='csv 数据源目录（--source csv 时必填）')
     p.add_argument('--no-cache', action='store_true', help='xtdata 数据源关闭内存缓存')
+    p.add_argument('--dividend-type', choices=list(DIVIDEND_TYPES), default=DEFAULT_DIVIDEND_TYPE,
+                   help='复权方式，默认 back（后复权）。不复权会把除权跳空当成真实下跌，'
+                        '严重压低分红股的动量分数；none 仅用于和旧结果对照')
     p.add_argument('--download', action='store_true', help='回测前先补下载本地日线')
     p.add_argument('--check-data', action='store_true',
                    help='只做 xtdata 数据自检并退出（配合 --download 会试下载一只标的）')
@@ -81,7 +85,7 @@ def build_source(args):
         return CsvDataSource(args.data_dir)
 
     from .datasource import XtDataSource
-    return XtDataSource(use_cache=not args.no_cache)
+    return XtDataSource(use_cache=not args.no_cache, dividend_type=args.dividend_type)
 
 
 def run_label(args, cfg: StrategyConfig) -> str:
@@ -103,6 +107,9 @@ def run_label(args, cfg: StrategyConfig) -> str:
         parts.append('ld')
     if not cfg.rsrs_enabled:
         parts.append('norsrs')
+    dividend = getattr(args, 'dividend_type', DEFAULT_DIVIDEND_TYPE)
+    if dividend != DEFAULT_DIVIDEND_TYPE:
+        parts.append(f'div{dividend}')
     return '_'.join(parts)
 
 
@@ -221,6 +228,7 @@ def main(argv=None) -> int:
                     'end_date': args.end,
                     'init_cash': args.cash,
                     'engine': args.engine,
+                    'dividend_type': args.dividend_type,
                     'elapsed_seconds': round(elapsed, 2),
                     'sectors': list(sectors),
                     'strategy': asdict(config.strategy),

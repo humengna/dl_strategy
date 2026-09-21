@@ -16,6 +16,7 @@ from momentum.sample_data import write_sample_dir
 class Args:
     start = '20240101'
     end = '20241231'
+    dividend_type = 'back'
 
 
 # ---------------- 目录命名 ----------------
@@ -36,6 +37,16 @@ def test_run_label_tags_only_non_default_params():
                          stop_loss_ratio=-0.1, filter_market_cap=False,
                          filter_limit_down=True, rsrs_enabled=False)
     assert run_label(Args(), cfg) == 'bt_20240101_20241231_lb15_dd1_sl10_nocap_ld_norsrs'
+
+
+def test_run_label_tags_non_default_dividend_type():
+    args = Args()
+    args.dividend_type = 'none'
+    assert run_label(args, StrategyConfig()) == 'bt_20240101_20241231_lb5_divnone'
+
+
+def test_run_label_omits_default_dividend_type():
+    assert 'div' not in run_label(Args(), StrategyConfig())
 
 
 def test_run_label_tags_disabled_cap_filter():
@@ -165,3 +176,13 @@ def test_no_cap_filter_flag_reaches_config(sample_dir, tmp_path):
         payload = json.load(f)
     assert payload['strategy']['filter_market_cap'] is False
     assert payload['label'].endswith('_nocap_norsrs')
+
+
+def test_dividend_type_recorded_in_summary(sample_dir, tmp_path):
+    out = tmp_path / 'div'
+    assert main(['--source', 'csv', '--data-dir', sample_dir,
+                 '--start', '20240401', '--end', '20240731',
+                 '--no-rsrs', '-q', '--out-dir', str(out)]) == 0
+
+    with open(out / 'summary.json', encoding='utf-8') as f:
+        assert json.load(f)['dividend_type'] == 'back'

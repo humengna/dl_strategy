@@ -916,6 +916,14 @@ PRELOAD_CHUNK_SIZE = 300
 # 所有 QMT 版本都支持的字段，作为 suspendFlag 不可用时的退路
 CORE_FIELDS = ('open', 'high', 'low', 'close', 'preClose', 'volume')
 
+# 复权方式。默认后复权：
+#   - 动量打分对对数价格做回归，除权跳空落在窗口内会被当成真实下跌，
+#     一次 2% 的现金分红经 244 天年化放大后能让分数只剩原来的 23%
+#   - 后复权的复权因子只由当日之前的除权事件决定，且不会被之后的分红改写，
+#     不含未来函数（前复权以最新日为锚，历史价格会被未来的分红改写）
+DIVIDEND_TYPES = ('none', 'front', 'back', 'front_ratio', 'back_ratio')
+DEFAULT_DIVIDEND_TYPE = 'back'
+
 NO_DATA_HINT = """
 [数据] xtdata 没有返回任何日线数据，请按以下顺序排查：
   1. QMT / 投研端客户端是否已启动并登录（xtdata 只读本机客户端的数据缓存）
@@ -1012,12 +1020,17 @@ class XtDataSource(DataSource):
     缓存未命中的标的会自动回落到实时查询。
     """
 
-    def __init__(self, use_cache: bool = True, market: str = 'SH'):
+    def __init__(self, use_cache: bool = True, market: str = 'SH',
+                 dividend_type: str = DEFAULT_DIVIDEND_TYPE):
         from xtquant import xtdata  # 延迟导入：没有 QMT 的机器也能 import 本模块
+
+        if dividend_type not in DIVIDEND_TYPES:
+            raise ValueError(f'不支持的复权方式 {dividend_type}，可选 {DIVIDEND_TYPES}')
 
         self._xtdata = xtdata
         self.use_cache = use_cache
         self.market = market
+        self.dividend_type = dividend_type
         self.fields = tuple(DAILY_FIELDS)
         self._cache: Dict[str, pd.DataFrame] = {}
         self._detail_cache: Dict[str, Optional[dict]] = {}
@@ -1048,7 +1061,7 @@ class XtDataSource(DataSource):
                 start_time=start_date,
                 end_time=end_date,
                 count=count,
-                dividend_type='none',
+                dividend_type=self.dividend_type,
                 fill_data=True,
             )
         except Exception as e:
@@ -1084,7 +1097,8 @@ class XtDataSource(DataSource):
             return
 
         stocks = list(dict.fromkeys(stocks))
-        print(f'[数据] 预加载 {len(stocks)} 只标的 {start_date} ~ {end_date} ...')
+        print(f'[数据] 预加载 {len(stocks)} 只标的 {start_date} ~ {end_date}'
+              f'（复权: {self.dividend_type}）...')
 
         if not self.resolve_fields(stocks, start_date, end_date):
             print(NO_DATA_HINT)
@@ -2686,7 +2700,7 @@ def _probe_bars(xtdata, stocks: Sequence[str], mode: str,
     """分别用完整字段和核心字段探测，打印返回形状"""
 
     for label, fields in (('完整字段', DAILY_FIELDS), ('核心字段', CORE_FIELDS)):
-        kwargs = dict(period='1d', dividend_type='none', fill_data=True)
+        kwargs = dict(period='1d', dividend_type=DEFAULT_DIVIDEND_TYPE, fill_data=True)
         if mode == 'count':
             kwargs.update(count=5)
             desc = f'count=5 / {label}'
@@ -2739,6 +2753,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--source', choices=['xtdata', 'csv'], default='xtdata', help='数据源')
     p.add_argument('--data-dir', default='', help='csv 数据源目录（--source csv 时必填）')
     p.add_argument('--no-cache', action='store_true', help='xtdata 数据源关闭内存缓存')
+    p.add_argument('--dividend-type', choices=list(DIVIDEND_TYPES), default=DEFAULT_DIVIDEND_TYPE,
+                   help='复权方式，默认 back（后复权）。不复权会把除权跳空当成真实下跌，'
+                        '严重压低分红股的动量分数；none 仅用于和旧结果对照')
     p.add_argument('--download', action='store_true', help='回测前先补下载本地日线')
     p.add_argument('--check-data', action='store_true',
                    help='只做 xtdata 数据自检并退出（配合 --download 会试下载一只标的）')
@@ -2784,7 +2801,7 @@ def build_source(args):
             raise SystemExit('--source csv 需要同时指定 --data-dir')
         return CsvDataSource(args.data_dir)
 
-    return XtDataSource(use_cache=not args.no_cache)
+    return XtDataSource(use_cache=not args.no_cache, dividend_type=args.dividend_type)
 
 
 def run_label(args, cfg: StrategyConfig) -> str:
@@ -2806,6 +2823,9 @@ def run_label(args, cfg: StrategyConfig) -> str:
         parts.append('ld')
     if not cfg.rsrs_enabled:
         parts.append('norsrs')
+    dividend = getattr(args, 'dividend_type', DEFAULT_DIVIDEND_TYPE)
+    if dividend != DEFAULT_DIVIDEND_TYPE:
+        parts.append(f'div{dividend}')
     return '_'.join(parts)
 
 
@@ -2923,6 +2943,7 @@ def main(argv=None) -> int:
                     'end_date': args.end,
                     'init_cash': args.cash,
                     'engine': args.engine,
+                    'dividend_type': args.dividend_type,
                     'elapsed_seconds': round(elapsed, 2),
                     'sectors': list(sectors),
                     'strategy': asdict(config.strategy),

@@ -50,7 +50,8 @@ class FakeXtdata:
     def get_market_data_ex(self, field_list, stock_list, period='1d', start_time='',
                            end_time='', count=-1, dividend_type='none', fill_data=True):
         self.calls.append({'fields': tuple(field_list), 'n_stocks': len(stock_list),
-                           'start': start_time, 'end': end_time, 'count': count})
+                           'start': start_time, 'end': end_time, 'count': count,
+                           'dividend_type': dividend_type})
 
         empty = {s: pd.DataFrame() for s in stock_list}
         if not self.has_local_data:
@@ -270,3 +271,42 @@ def test_preload_shows_progress_for_large_pool(make_xt, capsys):
     assert '[数据] 预加载' in out
     assert '100.0%' in out
     assert f'{len(stocks)}/{len(stocks)}' in out
+
+
+# ---------------- 复权方式 ----------------
+
+def test_default_dividend_type_is_back(make_xt):
+    """默认后复权：不复权会把除权跳空当成真实下跌，严重扭曲动量分数"""
+    from momentum.datasource import DEFAULT_DIVIDEND_TYPE
+
+    source, fake = make_xt()
+    assert DEFAULT_DIVIDEND_TYPE == 'back'
+    assert source.dividend_type == 'back'
+
+    source.preload(['600000.SH'], '20240102', '20240229')
+    assert {c['dividend_type'] for c in fake.calls} == {'back'}
+
+
+def test_dividend_type_reaches_every_query(make_xt):
+    import sys
+    import types
+
+    from momentum.datasource import XtDataSource
+
+    source, fake = make_xt()
+    module = sys.modules['xtquant']
+    other = XtDataSource(dividend_type='none')
+    assert isinstance(module, types.ModuleType)
+
+    other.preload(['600000.SH'], '20240102', '20240229')
+    fake.calls.clear()
+    other.get_bars(['000001.SZ'], '20240229', 3)        # 缓存未命中 -> 实时查询
+    assert {c['dividend_type'] for c in fake.calls} == {'none'}
+
+
+def test_invalid_dividend_type_rejected(make_xt):
+    from momentum.datasource import XtDataSource
+
+    make_xt()                                          # 装好桩 xtquant
+    with pytest.raises(ValueError, match='复权'):
+        XtDataSource(dividend_type='qfq')
