@@ -183,11 +183,14 @@ class VectorBacktestEngine(BacktestEngine):
         else:
             susp_ok = ~(suspend == 1)
 
-        with np.errstate(invalid='ignore'):
-            cap = np.where(total_value[None, :] > 0, total_value[None, :],
-                           shares[None, :] * np.where(close_ok, close, np.nan))
-            cap_ok = ~(np.isfinite(cap) & (cap > 0)) | (
-                (cap >= self.cfg.min_market_cap) & (cap <= self.cfg.max_market_cap))
+        if self.cfg.filter_market_cap:
+            with np.errstate(invalid='ignore'):
+                cap = np.where(total_value[None, :] > 0, total_value[None, :],
+                               shares[None, :] * np.where(close_ok, close, np.nan))
+                cap_ok = ~(np.isfinite(cap) & (cap > 0)) | (
+                    (cap >= self.cfg.min_market_cap) & (cap <= self.cfg.max_market_cap))
+        else:
+            cap_ok = np.ones((n, m), dtype=bool)
 
         self.pool_mask = close_ok & susp_ok & cap_ok & static_ok[None, :]
 

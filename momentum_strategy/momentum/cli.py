@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help='动量分数连续下降几天清仓')
     p.add_argument('--min-cap', type=float, default=StrategyConfig.min_market_cap, help='市值下限')
     p.add_argument('--max-cap', type=float, default=StrategyConfig.max_market_cap, help='市值上限')
+    p.add_argument('--no-cap-filter', action='store_true',
+                   help='关闭市值过滤，股票池取整个板块（对照 QMT 原脚本市值过滤失效时的口径）')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
     p.add_argument('--filter-limit-down', action='store_true',
                    help='过滤当日跌停的候选股。这是未来函数（下单在开盘，跌停要收盘才知道），'
@@ -95,6 +97,8 @@ def run_label(args, cfg: StrategyConfig) -> str:
         parts.append(f'dd{cfg.decline_days_to_sell}')
     if cfg.stop_loss_ratio != default.stop_loss_ratio:
         parts.append('sl%g' % round(abs(cfg.stop_loss_ratio) * 100, 4))
+    if not cfg.filter_market_cap:
+        parts.append('nocap')
     if cfg.filter_limit_down:
         parts.append('ld')
     if not cfg.rsrs_enabled:
@@ -171,6 +175,7 @@ def main(argv=None) -> int:
                 lookback_days=lookback,
                 stop_loss_ratio=args.stop_loss,
                 decline_days_to_sell=args.decline_days,
+                filter_market_cap=not args.no_cap_filter,
                 min_market_cap=args.min_cap,
                 max_market_cap=args.max_cap,
                 rsrs_enabled=not args.no_rsrs,

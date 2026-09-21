@@ -67,3 +67,23 @@ def test_filter_universe_keeps_stock_without_market_cap(source_factory):
     source = source_factory(frames, details, {'沪深A股': ['600000.SH']})
     cfg = StrategyConfig()
     assert filter_universe(source, ['600000.SH'], dates[-1], cfg) == ['600000.SH']
+
+
+def test_no_cap_filter_keeps_oversized_stocks(source_factory):
+    """关闭市值过滤后，超出区间的标的应保留（ST / 停牌仍然剔除）"""
+    dates, source = build_source(source_factory)
+    pool = build_base_pool(source, StrategyConfig())
+
+    on = filter_universe(source, pool, dates[-1], StrategyConfig())
+    off = filter_universe(source, pool, dates[-1], StrategyConfig(filter_market_cap=False))
+
+    assert on == ['000001.SZ', '600000.SH']
+    # 688981 市值 900 亿，开关关闭后回到池子里；300750 仍因 ST 被剔除
+    assert off == ['000001.SZ', '600000.SH', '688981.SH']
+
+
+def test_no_cap_filter_ignores_cap_bounds(source_factory):
+    dates, source = build_source(source_factory)
+    pool = build_base_pool(source, StrategyConfig())
+    cfg = StrategyConfig(filter_market_cap=False, min_market_cap=1e12, max_market_cap=2e12)
+    assert filter_universe(source, pool, dates[-1], cfg) == ['000001.SZ', '600000.SH', '688981.SH']

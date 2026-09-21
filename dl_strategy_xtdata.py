@@ -227,6 +227,7 @@ class StrategyConfig:
 
     # 股票池
     concept_sectors: Tuple[str, ...] = CONCEPT_SECTORS_DEFAULT
+    filter_market_cap: bool = True         # 是否启用市值过滤
     min_market_cap: float = 30e8           # 市值下限
     max_market_cap: float = 500e8          # 市值上限
     exclude_st: bool = True
@@ -1352,7 +1353,7 @@ def filter_universe(source: DataSource, base_pool: Sequence[str],
     用截至 date（含）的数据过滤股票池：
       - 停牌（suspendFlag == 1）
       - ST
-      - 市值不在 [min_market_cap, max_market_cap] 区间
+      - 市值不在 [min_market_cap, max_market_cap] 区间（filter_market_cap=False 可关闭）
     取不到市值的标的不因此被剔除（与原脚本一致）。
     """
     if not base_pool:
@@ -1386,9 +1387,10 @@ def filter_universe(source: DataSource, base_pool: Sequence[str],
             if 'ST' in name:
                 continue
 
-        market_cap = source.get_market_cap(stock, last_close)
-        if market_cap > 0 and not (cfg.min_market_cap <= market_cap <= cfg.max_market_cap):
-            continue
+        if cfg.filter_market_cap:
+            market_cap = source.get_market_cap(stock, last_close)
+            if market_cap > 0 and not (cfg.min_market_cap <= market_cap <= cfg.max_market_cap):
+                continue
 
         result.append(stock)
 
@@ -2088,11 +2090,14 @@ class VectorBacktestEngine(BacktestEngine):
         else:
             susp_ok = ~(suspend == 1)
 
-        with np.errstate(invalid='ignore'):
-            cap = np.where(total_value[None, :] > 0, total_value[None, :],
-                           shares[None, :] * np.where(close_ok, close, np.nan))
-            cap_ok = ~(np.isfinite(cap) & (cap > 0)) | (
-                (cap >= self.cfg.min_market_cap) & (cap <= self.cfg.max_market_cap))
+        if self.cfg.filter_market_cap:
+            with np.errstate(invalid='ignore'):
+                cap = np.where(total_value[None, :] > 0, total_value[None, :],
+                               shares[None, :] * np.where(close_ok, close, np.nan))
+                cap_ok = ~(np.isfinite(cap) & (cap > 0)) | (
+                    (cap >= self.cfg.min_market_cap) & (cap <= self.cfg.max_market_cap))
+        else:
+            cap_ok = np.ones((n, m), dtype=bool)
 
         self.pool_mask = close_ok & susp_ok & cap_ok & static_ok[None, :]
 
@@ -2746,6 +2751,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help='动量分数连续下降几天清仓')
     p.add_argument('--min-cap', type=float, default=StrategyConfig.min_market_cap, help='市值下限')
     p.add_argument('--max-cap', type=float, default=StrategyConfig.max_market_cap, help='市值上限')
+    p.add_argument('--no-cap-filter', action='store_true',
+                   help='关闭市值过滤，股票池取整个板块（对照 QMT 原脚本市值过滤失效时的口径）')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
     p.add_argument('--filter-limit-down', action='store_true',
                    help='过滤当日跌停的候选股。这是未来函数（下单在开盘，跌停要收盘才知道），'
@@ -2793,6 +2800,8 @@ def run_label(args, cfg: StrategyConfig) -> str:
         parts.append(f'dd{cfg.decline_days_to_sell}')
     if cfg.stop_loss_ratio != default.stop_loss_ratio:
         parts.append('sl%g' % round(abs(cfg.stop_loss_ratio) * 100, 4))
+    if not cfg.filter_market_cap:
+        parts.append('nocap')
     if cfg.filter_limit_down:
         parts.append('ld')
     if not cfg.rsrs_enabled:
@@ -2868,6 +2877,7 @@ def main(argv=None) -> int:
                 lookback_days=lookback,
                 stop_loss_ratio=args.stop_loss,
                 decline_days_to_sell=args.decline_days,
+                filter_market_cap=not args.no_cap_filter,
                 min_market_cap=args.min_cap,
                 max_market_cap=args.max_cap,
                 rsrs_enabled=not args.no_rsrs,

@@ -33,9 +33,14 @@ def test_run_label_differs_per_lookback():
 
 def test_run_label_tags_only_non_default_params():
     cfg = StrategyConfig(lookback_days=15, decline_days_to_sell=1,
-                         stop_loss_ratio=-0.1, filter_limit_down=True,
-                         rsrs_enabled=False)
-    assert run_label(Args(), cfg) == 'bt_20240101_20241231_lb15_dd1_sl10_ld_norsrs'
+                         stop_loss_ratio=-0.1, filter_market_cap=False,
+                         filter_limit_down=True, rsrs_enabled=False)
+    assert run_label(Args(), cfg) == 'bt_20240101_20241231_lb15_dd1_sl10_nocap_ld_norsrs'
+
+
+def test_run_label_tags_disabled_cap_filter():
+    cfg = StrategyConfig(filter_market_cap=False)
+    assert run_label(Args(), cfg) == 'bt_20240101_20241231_lb5_nocap'
 
 
 def test_run_label_default_params_stay_short():
@@ -147,3 +152,16 @@ def test_duplicate_lookbacks_run_once(sample_dir, tmp_path, capsys):
                  '--lookback', '15', '15', '--no-rsrs', '-q',
                  '--out-dir', str(out)]) == 0
     assert os.path.isfile(out / 'equity.csv')       # 去重后只剩一组，不套子目录
+
+
+def test_no_cap_filter_flag_reaches_config(sample_dir, tmp_path):
+    out = tmp_path / 'nocap'
+    assert main(['--source', 'csv', '--data-dir', sample_dir,
+                 '--start', '20240401', '--end', '20240731',
+                 '--no-rsrs', '--no-cap-filter', '-q',
+                 '--out-dir', str(out)]) == 0
+
+    with open(out / 'summary.json', encoding='utf-8') as f:
+        payload = json.load(f)
+    assert payload['strategy']['filter_market_cap'] is False
+    assert payload['label'].endswith('_nocap_norsrs')

@@ -45,7 +45,7 @@ def filter_universe(source: DataSource, base_pool: Sequence[str],
     用截至 date（含）的数据过滤股票池：
       - 停牌（suspendFlag == 1）
       - ST
-      - 市值不在 [min_market_cap, max_market_cap] 区间
+      - 市值不在 [min_market_cap, max_market_cap] 区间（filter_market_cap=False 可关闭）
     取不到市值的标的不因此被剔除（与原脚本一致）。
     """
     if not base_pool:
@@ -79,9 +79,10 @@ def filter_universe(source: DataSource, base_pool: Sequence[str],
             if 'ST' in name:
                 continue
 
-        market_cap = source.get_market_cap(stock, last_close)
-        if market_cap > 0 and not (cfg.min_market_cap <= market_cap <= cfg.max_market_cap):
-            continue
+        if cfg.filter_market_cap:
+            market_cap = source.get_market_cap(stock, last_close)
+            if market_cap > 0 and not (cfg.min_market_cap <= market_cap <= cfg.max_market_cap):
+                continue
 
         result.append(stock)
 

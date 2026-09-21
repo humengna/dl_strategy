@@ -204,3 +204,32 @@ def test_tradable_matrix_excludes_suspended(source_factory):
     i = engine.panel.date_pos[dates[-1]]
     j = engine.panel.stock_pos['600000.SH']
     assert bool(engine.tradable[i, j]) is False
+
+
+def test_engines_identical_without_cap_filter():
+    """关闭市值过滤后，两个引擎仍必须逐笔一致"""
+    loop, fast = run_both(filter_market_cap=False)
+    np.testing.assert_allclose(fast.values, loop.values, rtol=0, atol=0)
+    assert deal_key(fast.account.deals) == deal_key(loop.account.deals)
+
+
+def test_pool_mask_respects_cap_switch(source_factory):
+    """关掉市值过滤后，超出区间的标的应进入可选池"""
+    from momentum.sample_data import make_calendar
+    from tests.conftest import make_frame
+
+    dates = make_calendar(30, start='20240102')
+    frames = {'600000.SH': make_frame(dates, [10.0] * 30),
+              '688981.SH': make_frame(dates, [20.0] * 30)}
+    details = {'600000.SH': {'InstrumentName': '甲', 'TotalValue': 100e8},
+               '688981.SH': {'InstrumentName': '乙', 'TotalValue': 900e8}}   # 超上限
+    source = source_factory(frames, details, {'沪深A股': list(frames)})
+
+    def pool_size(**kw):
+        engine = build(VectorBacktestEngine, source, dates[20], dates[-1], **kw)
+        engine.prepare()
+        i = engine.panel.date_pos[dates[-1]]
+        return int(engine.pool_mask[i].sum())
+
+    assert pool_size() == 1                              # 默认过滤掉 900 亿那只
+    assert pool_size(filter_market_cap=False) == 2       # 关闭后两只都在

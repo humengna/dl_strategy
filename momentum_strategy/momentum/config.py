@@ -34,6 +34,7 @@ class StrategyConfig:
 
     # 股票池
     concept_sectors: Tuple[str, ...] = CONCEPT_SECTORS_DEFAULT
+    filter_market_cap: bool = True         # 是否启用市值过滤
     min_market_cap: float = 30e8           # 市值下限
     max_market_cap: float = 500e8          # 市值上限
     exclude_st: bool = True

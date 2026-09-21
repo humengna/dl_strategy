@@ -66,7 +66,7 @@ bt_20240101_20241231_lb15_dd1_ld       回看 15 天、连降 1 天清仓、打�
 ```
 
 短标签含义：`lb` 回看天数、`dd` 连续下降清仓天数、`sl` 止损百分比、
-`ld` 打开跌停过滤、`norsrs` 跳过 RSRS。目录里包含：
+`nocap` 关闭市值过滤、`ld` 打开跌停过滤、`norsrs` 跳过 RSRS。目录里包含：
 
 | 文件 | 内容 |
 |---|---|
@@ -83,6 +83,7 @@ bt_20240101_20241231_lb15_dd1_ld       回看 15 天、连降 1 天清仓、打�
 | 参数 | 默认值 | 原脚本 |
 |---|---|---|
 | `concept_sectors` | `('沪深A股',)` | `CONCEPT_SECTORS=['沪深a股']`（完整概念列表保留为 `CONCEPT_SECTORS_FULL`） |
+| `filter_market_cap` | True | 原脚本恒为 True，但因 bug 实际失效（见下） |
 | `min_market_cap` / `max_market_cap` | 30亿 / 500亿 | `MIN_MARKET_CAP` / `MAX_MARKET_CAP` |
 | `lookback_days` | 5 | `LOOKBACK_DAYS = 5`（原注释里另有 29） |
 | `trading_days_per_year` | 244 | `TRADING_DAYS_PER_YEAR` |
@@ -156,7 +157,8 @@ python run_backtest.py --check-data --download   # 顺便试下载一只标的
 
 常用参数：`--lookback` 回看天数（可多值）、`--stop-loss` 止损线、`--decline-days` 连续下降
 清仓天数、`--min-cap/--max-cap` 市值区间、`--sectors` 板块（逗号分隔）、
-`--no-rsrs` 跳过 RSRS、`--no-cache` 关闭行情内存缓存、`--engine loop` 切回逐日引擎、
+`--no-rsrs` 跳过 RSRS、`--no-cap-filter` 关闭市值过滤、`--no-cache` 关闭行情内存缓存、
+`--engine loop` 切回逐日引擎、
 `--out-dir` 指定结果目录、`--no-save` 不保存结果、`-q` 只输出进度条和最终统计，
 以及上面那四个费率参数。
 
@@ -196,12 +198,38 @@ momentum_strategy/
 python -m pytest
 ```
 
-147 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
+153 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
 「当日 K 线不参与打分」的未来函数检查）、股票池过滤、择时信号、T+1 与费用、
 调仓与止损、绩效统计，以及 xtdata 取数行为（分批、字段退回、无数据报错，
 用桩 xtquant 注入，不需要 QMT）、进度条渲染、
 向量化指标与 polyfit 的数值一致性、两个引擎的逐笔结果一致性、结果文件落盘，
 以及命令行的结果目录命名与多组参数回测。
+
+## 关于市值过滤
+
+原脚本的市值过滤**实际上是失效的**：
+
+```python
+total_value = detail.get('TotalValue', 0)
+if total_value <= 0:
+    total_shares = detail.get('TotalShares', 0)
+    if total_shares > 0 and last_close > 0:   # last_close 未定义 -> NameError
+        ...
+```
+
+`get_instrument_detail` 在 QMT 回测环境里返回的 `TotalValue` 是 0，于是走进兜底分支
+撞上未定义的 `last_close`，异常被外层 `except: pass` 吞掉，整只票直接放行。
+实测 QMT 跑出来的股票池是 4959~5009 只，约等于全市场。
+
+本项目修掉了这个 bug（`TotalValue` 缺失时依次尝试 `TotalVolume` / `TotalVolumn` /
+`TotalShares` × 收盘价），所以市值过滤是真在工作的。想复现原脚本那种「全市场」
+口径做对照，用 `--no-cap-filter`：
+
+```bash
+python run_backtest.py --start 20260105 --end 20260918 --no-cap-filter --cash 1000000
+```
+
+注意两种口径是**两个不同的策略**：一个在 30~500 亿的池子里选，一个在全市场选。
 
 ## 与原 QMT 脚本的差异
 
