@@ -109,6 +109,10 @@ class SimAccount:
             return 0
 
         lot = self.cfg.lot_size
+        if not self.cfg.reserve_fee_on_buy:
+            # 原脚本口径：不预留费用，直接按可用资金整除
+            return int(self.cash / price / lot) * lot
+
         raw = self.cash / (price * (1 + self.cfg.buy_cost_rate))
         volume = int(raw / lot) * lot
 

@@ -66,6 +66,17 @@ class StrategyConfig:
     # 注意这是未来函数：下单在当日开盘，而跌停要用当日收盘价才能确认。
     # 默认关闭；置 True 可复现原脚本的口径，用于对比两种假设下的差别。
     filter_limit_down: bool = False
+    # 跌停幅度：0 表示按代码前缀区分（主板 10%、创业板/科创板 20%）；
+    # >0 表示固定比例，原脚本恒用 0.10，会把跌 10% 的创业板票误判为跌停
+    limit_down_ratio: float = 0.0
+
+    # 停牌的票是否允许卖出。原脚本卖出端不查停牌，会按前收填充价成交；
+    # 置 True 复刻该行为
+    allow_sell_suspended: bool = False
+
+    # 是否跳过回测区间开头的 warmup_days 个交易日不交易
+    # （原脚本 bar_count < LOOKBACK_DAYS + 10 时直接 return）
+    skip_warmup_bars: bool = False
 
     # 风控
     stop_loss_ratio: float = -0.15         # 固定硬止损线
@@ -105,6 +116,9 @@ class AccountConfig:
 
     lot_size: int = 100                    # 一手股数
     t_plus_one: bool = True                # 当日买入次日才可卖
+    # 买入数量是否预留手续费。原脚本直接 int(可用资金/价格/100)*100，
+    # 不留费用，置 False 复刻该行为
+    reserve_fee_on_buy: bool = True
 
     @property
     def buy_cost_rate(self) -> float:

@@ -145,7 +145,8 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
     if cfg.filter_limit_down:
         last_close = float(df['close'].iloc[-1]) if 'close' in df.columns else 0.0
         pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else last_close
-        limit_down = round(pre_close * (1 - limit_ratio(stock)), 2)
+        ratio = cfg.limit_down_ratio if cfg.limit_down_ratio > 0 else limit_ratio(stock)
+        limit_down = round(pre_close * (1 - ratio), 2)
         if last_close > 0 and last_close <= limit_down:
             log.info('%s 跌停，收盘:%.2f 跌停价:%.2f', stock, last_close, limit_down)
             return None

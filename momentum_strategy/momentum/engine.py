@@ -133,8 +133,19 @@ class BacktestEngine:
 
         result = BacktestResult(account=self.account)
         bar = Progress(len(run_days), prefix='[回测] 交易日', enabled=show_progress)
+        # 原脚本是 bar_count < LOOKBACK_DAYS + 10 时 return，
+        # 即前 warmup_days - 1 根 bar 不交易，第 warmup_days 根开始交易
+        skip = (self.cfg.warmup_days - 1) if self.cfg.skip_warmup_bars else 0
+        if skip:
+            log.info('前 %d 个交易日为预热期，不交易', skip)
+
         for n, date in enumerate(run_days, 1):
-            total = self.run_day(date)
+            if n <= skip:
+                self._last_signal = ''
+                self.today_target = None
+                total = self.review(date)
+            else:
+                total = self.run_day(date)
             result.equity_curve.append((date, total))
             result.signals.append((date, self._last_signal, self.today_target))
             result.daily.append(self.daily_record(date, total))
@@ -251,7 +262,7 @@ class BacktestEngine:
     def _sell_at_open(self, date: str, stock: str, msg: str) -> None:
         # 停牌的票卖不掉，只能继续持有 —— 停牌日的 K 线是用前收填充的，
         # 照着它成交等于凭空按停牌前的价格脱手
-        if is_suspended(self.source, stock, date):
+        if not self.cfg.allow_sell_suspended and is_suspended(self.source, stock, date):
             log.info('%s 当日停牌，无法卖出，继续持有', stock)
             return
 
@@ -276,7 +287,7 @@ class BacktestEngine:
             if close <= 0:
                 continue
 
-            if is_suspended(self.source, pos.stock, date):
+            if not self.cfg.allow_sell_suspended and is_suspended(self.source, pos.stock, date):
                 log.info('%s 当日停牌，止损无法执行，继续持有', pos.stock)
                 continue
 

@@ -208,7 +208,10 @@ class VectorBacktestEngine(BacktestEngine):
 
         # 跌停过滤（未来函数，默认关闭，与逐日版的 filter_limit_down 对应）
         if self.cfg.filter_limit_down:
-            ratios = np.array([limit_ratio(s) for s in panel.stocks])
+            if self.cfg.limit_down_ratio > 0:
+                ratios = np.full(len(panel.stocks), self.cfg.limit_down_ratio)
+            else:
+                ratios = np.array([limit_ratio(s) for s in panel.stocks])
             pre_close = panel.field('preClose')
             if pre_close is None:
                 pre_close = close

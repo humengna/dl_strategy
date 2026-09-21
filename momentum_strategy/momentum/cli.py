@@ -53,6 +53,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--no-cap-filter', action='store_true',
                    help='关闭市值过滤，股票池取整个板块（对照 QMT 原脚本市值过滤失效时的口径）')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
+    p.add_argument('--replicate-qmt', action='store_true',
+                   help='完全复刻原 QMT 脚本的行为（含它的已知缺陷），'
+                        '会覆盖下面这些开关：市值过滤关闭、不复权、跌停过滤按固定 10%%、'
+                        '停牌也能卖出、买入不预留费用、开头 15 个交易日不交易')
+    p.add_argument('--limit-down-ratio', type=float, default=StrategyConfig.limit_down_ratio,
+                   help='跌停幅度，0=按代码前缀区分 10%%/20%%（默认），0.10=原脚本的固定 10%%')
+    p.add_argument('--allow-sell-suspended', action='store_true',
+                   help='允许卖出停牌股（按前收填充价成交），复刻原脚本卖出端不查停牌的行为')
+    p.add_argument('--no-fee-reserve', action='store_true',
+                   help='买入数量不预留手续费，复刻原脚本 int(可用资金/价格/100)*100')
+    p.add_argument('--skip-warmup', action='store_true',
+                   help='回测区间开头 warmup 个交易日不交易，复刻原脚本 bar_count 判断')
     p.add_argument('--filter-limit-down', action='store_true',
                    help='过滤当日跌停的候选股。这是未来函数（下单在开盘，跌停要收盘才知道），'
                         '默认不过滤，打开用于复现原脚本口径')
@@ -88,6 +100,27 @@ def build_source(args):
     return XtDataSource(use_cache=not args.no_cache, dividend_type=args.dividend_type)
 
 
+QMT_PRESET = {
+    'no_cap_filter': True,        # 原脚本市值过滤因 NameError 被吞而失效，池子=全市场
+    'dividend_type': 'none',      # 原脚本 dividend_type='none'
+    'filter_limit_down': True,    # 原脚本按当日收盘价判断跌停
+    'limit_down_ratio': 0.10,     # 且恒用固定 10%，不区分创业板/科创板
+    'allow_sell_suspended': True, # 原脚本卖出端不查停牌
+    'no_fee_reserve': True,       # 原脚本买入量不预留手续费
+    'skip_warmup': True,          # 原脚本前 LOOKBACK+10 根 bar 不交易
+}
+
+
+def apply_qmt_preset(args) -> None:
+    """把命令行参数整体切到原 QMT 脚本的口径（含它的已知缺陷）"""
+    for key, value in QMT_PRESET.items():
+        setattr(args, key, value)
+    print('[复刻模式] 已切换到原 QMT 脚本口径：')
+    print('  市值过滤关闭 / 不复权 / 跌停按固定 10% 过滤 / 停牌可卖出')
+    print('  / 买入不预留费用 / 开头预热期不交易')
+    print('  注意：这些是为了对齐原脚本而保留的缺陷，结果会偏乐观，不要用来评估策略本身')
+
+
 def run_label(args, cfg: StrategyConfig) -> str:
     """
     回测结果目录名：起止日期 + 回看天数，非默认的关键参数再追加短标签，
@@ -101,6 +134,8 @@ def run_label(args, cfg: StrategyConfig) -> str:
         parts.append(f'dd{cfg.decline_days_to_sell}')
     if cfg.stop_loss_ratio != default.stop_loss_ratio:
         parts.append('sl%g' % round(abs(cfg.stop_loss_ratio) * 100, 4))
+    if getattr(args, 'replicate_qmt', False):
+        parts.append('qmt')
     if not cfg.filter_market_cap:
         parts.append('nocap')
     if cfg.filter_limit_down:
@@ -164,6 +199,9 @@ def main(argv=None) -> int:
                           try_download=args.download)
         return 0 if ok else 1
 
+    if args.replicate_qmt:
+        apply_qmt_preset(args)
+
     sectors = tuple(s.strip() for s in args.sectors.split(',') if s.strip()) \
         or CONCEPT_SECTORS_DEFAULT
 
@@ -187,6 +225,9 @@ def main(argv=None) -> int:
                 max_market_cap=args.max_cap,
                 rsrs_enabled=not args.no_rsrs,
                 filter_limit_down=args.filter_limit_down,
+                limit_down_ratio=args.limit_down_ratio,
+                allow_sell_suspended=args.allow_sell_suspended,
+                skip_warmup_bars=args.skip_warmup,
             ),
             account=AccountConfig(
                 init_cash=args.cash,
@@ -194,6 +235,7 @@ def main(argv=None) -> int:
                 min_commission=args.min_commission,
                 transfer_fee_rate=args.transfer_fee,
                 stamp_tax_rate=args.stamp_tax,
+                reserve_fee_on_buy=not args.no_fee_reserve,
             ),
         )
         label = run_label(args, config.strategy)
@@ -229,6 +271,7 @@ def main(argv=None) -> int:
                     'init_cash': args.cash,
                     'engine': args.engine,
                     'dividend_type': args.dividend_type,
+                    'replicate_qmt': args.replicate_qmt,
                     'elapsed_seconds': round(elapsed, 2),
                     'sectors': list(sectors),
                     'strategy': asdict(config.strategy),

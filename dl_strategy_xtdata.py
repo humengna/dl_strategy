@@ -259,6 +259,17 @@ class StrategyConfig:
     # 注意这是未来函数：下单在当日开盘，而跌停要用当日收盘价才能确认。
     # 默认关闭；置 True 可复现原脚本的口径，用于对比两种假设下的差别。
     filter_limit_down: bool = False
+    # 跌停幅度：0 表示按代码前缀区分（主板 10%、创业板/科创板 20%）；
+    # >0 表示固定比例，原脚本恒用 0.10，会把跌 10% 的创业板票误判为跌停
+    limit_down_ratio: float = 0.0
+
+    # 停牌的票是否允许卖出。原脚本卖出端不查停牌，会按前收填充价成交；
+    # 置 True 复刻该行为
+    allow_sell_suspended: bool = False
+
+    # 是否跳过回测区间开头的 warmup_days 个交易日不交易
+    # （原脚本 bar_count < LOOKBACK_DAYS + 10 时直接 return）
+    skip_warmup_bars: bool = False
 
     # 风控
     stop_loss_ratio: float = -0.15         # 固定硬止损线
@@ -298,6 +309,9 @@ class AccountConfig:
 
     lot_size: int = 100                    # 一手股数
     t_plus_one: bool = True                # 当日买入次日才可卖
+    # 买入数量是否预留手续费。原脚本直接 int(可用资金/价格/100)*100，
+    # 不留费用，置 False 复刻该行为
+    reserve_fee_on_buy: bool = True
 
     @property
     def buy_cost_rate(self) -> float:
@@ -820,6 +834,10 @@ class SimAccount:
             return 0
 
         lot = self.cfg.lot_size
+        if not self.cfg.reserve_fee_on_buy:
+            # 原脚本口径：不预留费用，直接按可用资金整除
+            return int(self.cash / price / lot) * lot
+
         raw = self.cash / (price * (1 + self.cfg.buy_cost_rate))
         volume = int(raw / lot) * lot
 
@@ -1562,7 +1580,8 @@ def filter_target(source: DataSource, stock: Optional[str], date: str,
     if cfg.filter_limit_down:
         last_close = float(df['close'].iloc[-1]) if 'close' in df.columns else 0.0
         pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else last_close
-        limit_down = round(pre_close * (1 - limit_ratio(stock)), 2)
+        ratio = cfg.limit_down_ratio if cfg.limit_down_ratio > 0 else limit_ratio(stock)
+        limit_down = round(pre_close * (1 - ratio), 2)
         if last_close > 0 and last_close <= limit_down:
             log.info('%s 跌停，收盘:%.2f 跌停价:%.2f', stock, last_close, limit_down)
             return None
@@ -1784,8 +1803,19 @@ class BacktestEngine:
 
         result = BacktestResult(account=self.account)
         bar = Progress(len(run_days), prefix='[回测] 交易日', enabled=show_progress)
+        # 原脚本是 bar_count < LOOKBACK_DAYS + 10 时 return，
+        # 即前 warmup_days - 1 根 bar 不交易，第 warmup_days 根开始交易
+        skip = (self.cfg.warmup_days - 1) if self.cfg.skip_warmup_bars else 0
+        if skip:
+            log.info('前 %d 个交易日为预热期，不交易', skip)
+
         for n, date in enumerate(run_days, 1):
-            total = self.run_day(date)
+            if n <= skip:
+                self._last_signal = ''
+                self.today_target = None
+                total = self.review(date)
+            else:
+                total = self.run_day(date)
             result.equity_curve.append((date, total))
             result.signals.append((date, self._last_signal, self.today_target))
             result.daily.append(self.daily_record(date, total))
@@ -1902,7 +1932,7 @@ class BacktestEngine:
     def _sell_at_open(self, date: str, stock: str, msg: str) -> None:
         # 停牌的票卖不掉，只能继续持有 —— 停牌日的 K 线是用前收填充的，
         # 照着它成交等于凭空按停牌前的价格脱手
-        if is_suspended(self.source, stock, date):
+        if not self.cfg.allow_sell_suspended and is_suspended(self.source, stock, date):
             log.info('%s 当日停牌，无法卖出，继续持有', stock)
             return
 
@@ -1927,7 +1957,7 @@ class BacktestEngine:
             if close <= 0:
                 continue
 
-            if is_suspended(self.source, pos.stock, date):
+            if not self.cfg.allow_sell_suspended and is_suspended(self.source, pos.stock, date):
                 log.info('%s 当日停牌，止损无法执行，继续持有', pos.stock)
                 continue
 
@@ -2171,7 +2201,10 @@ class VectorBacktestEngine(BacktestEngine):
 
         # 跌停过滤（未来函数，默认关闭，与逐日版的 filter_limit_down 对应）
         if self.cfg.filter_limit_down:
-            ratios = np.array([limit_ratio(s) for s in panel.stocks])
+            if self.cfg.limit_down_ratio > 0:
+                ratios = np.full(len(panel.stocks), self.cfg.limit_down_ratio)
+            else:
+                ratios = np.array([limit_ratio(s) for s in panel.stocks])
             pre_close = panel.field('preClose')
             if pre_close is None:
                 pre_close = close
@@ -2817,6 +2850,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--no-cap-filter', action='store_true',
                    help='关闭市值过滤，股票池取整个板块（对照 QMT 原脚本市值过滤失效时的口径）')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
+    p.add_argument('--replicate-qmt', action='store_true',
+                   help='完全复刻原 QMT 脚本的行为（含它的已知缺陷），'
+                        '会覆盖下面这些开关：市值过滤关闭、不复权、跌停过滤按固定 10%%、'
+                        '停牌也能卖出、买入不预留费用、开头 15 个交易日不交易')
+    p.add_argument('--limit-down-ratio', type=float, default=StrategyConfig.limit_down_ratio,
+                   help='跌停幅度，0=按代码前缀区分 10%%/20%%（默认），0.10=原脚本的固定 10%%')
+    p.add_argument('--allow-sell-suspended', action='store_true',
+                   help='允许卖出停牌股（按前收填充价成交），复刻原脚本卖出端不查停牌的行为')
+    p.add_argument('--no-fee-reserve', action='store_true',
+                   help='买入数量不预留手续费，复刻原脚本 int(可用资金/价格/100)*100')
+    p.add_argument('--skip-warmup', action='store_true',
+                   help='回测区间开头 warmup 个交易日不交易，复刻原脚本 bar_count 判断')
     p.add_argument('--filter-limit-down', action='store_true',
                    help='过滤当日跌停的候选股。这是未来函数（下单在开盘，跌停要收盘才知道），'
                         '默认不过滤，打开用于复现原脚本口径')
@@ -2850,6 +2895,27 @@ def build_source(args):
     return XtDataSource(use_cache=not args.no_cache, dividend_type=args.dividend_type)
 
 
+QMT_PRESET = {
+    'no_cap_filter': True,        # 原脚本市值过滤因 NameError 被吞而失效，池子=全市场
+    'dividend_type': 'none',      # 原脚本 dividend_type='none'
+    'filter_limit_down': True,    # 原脚本按当日收盘价判断跌停
+    'limit_down_ratio': 0.10,     # 且恒用固定 10%，不区分创业板/科创板
+    'allow_sell_suspended': True, # 原脚本卖出端不查停牌
+    'no_fee_reserve': True,       # 原脚本买入量不预留手续费
+    'skip_warmup': True,          # 原脚本前 LOOKBACK+10 根 bar 不交易
+}
+
+
+def apply_qmt_preset(args) -> None:
+    """把命令行参数整体切到原 QMT 脚本的口径（含它的已知缺陷）"""
+    for key, value in QMT_PRESET.items():
+        setattr(args, key, value)
+    print('[复刻模式] 已切换到原 QMT 脚本口径：')
+    print('  市值过滤关闭 / 不复权 / 跌停按固定 10% 过滤 / 停牌可卖出')
+    print('  / 买入不预留费用 / 开头预热期不交易')
+    print('  注意：这些是为了对齐原脚本而保留的缺陷，结果会偏乐观，不要用来评估策略本身')
+
+
 def run_label(args, cfg: StrategyConfig) -> str:
     """
     回测结果目录名：起止日期 + 回看天数，非默认的关键参数再追加短标签，
@@ -2863,6 +2929,8 @@ def run_label(args, cfg: StrategyConfig) -> str:
         parts.append(f'dd{cfg.decline_days_to_sell}')
     if cfg.stop_loss_ratio != default.stop_loss_ratio:
         parts.append('sl%g' % round(abs(cfg.stop_loss_ratio) * 100, 4))
+    if getattr(args, 'replicate_qmt', False):
+        parts.append('qmt')
     if not cfg.filter_market_cap:
         parts.append('nocap')
     if cfg.filter_limit_down:
@@ -2925,6 +2993,9 @@ def main(argv=None) -> int:
                           try_download=args.download)
         return 0 if ok else 1
 
+    if args.replicate_qmt:
+        apply_qmt_preset(args)
+
     sectors = tuple(s.strip() for s in args.sectors.split(',') if s.strip()) \
         or CONCEPT_SECTORS_DEFAULT
 
@@ -2948,6 +3019,9 @@ def main(argv=None) -> int:
                 max_market_cap=args.max_cap,
                 rsrs_enabled=not args.no_rsrs,
                 filter_limit_down=args.filter_limit_down,
+                limit_down_ratio=args.limit_down_ratio,
+                allow_sell_suspended=args.allow_sell_suspended,
+                skip_warmup_bars=args.skip_warmup,
             ),
             account=AccountConfig(
                 init_cash=args.cash,
@@ -2955,6 +3029,7 @@ def main(argv=None) -> int:
                 min_commission=args.min_commission,
                 transfer_fee_rate=args.transfer_fee,
                 stamp_tax_rate=args.stamp_tax,
+                reserve_fee_on_buy=not args.no_fee_reserve,
             ),
         )
         label = run_label(args, config.strategy)
@@ -2990,6 +3065,7 @@ def main(argv=None) -> int:
                     'init_cash': args.cash,
                     'engine': args.engine,
                     'dividend_type': args.dividend_type,
+                    'replicate_qmt': args.replicate_qmt,
                     'elapsed_seconds': round(elapsed, 2),
                     'sectors': list(sectors),
                     'strategy': asdict(config.strategy),
