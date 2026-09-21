@@ -57,8 +57,16 @@ RSRS 修正标准分（N=21, M=600, 沪深300）**只计算和打印，不参与
 
 ## 回测结果
 
-每次回测默认写到 `results/bt_<起止日期>_<时间戳>/`（`--out-dir` 可指定，
-`--no-save` 关闭）：
+每次回测默认写到 `results/<标签>_<时间戳>/`（`--out-dir` 可指定，`--no-save` 关闭）。
+标签由起止日期、回看天数和非默认的关键参数拼成，不同参数的结果放一起也能一眼区分：
+
+```
+bt_20240101_20241231_lb29              回看 29 天，其余都是默认值
+bt_20240101_20241231_lb15_dd1_ld       回看 15 天、连降 1 天清仓、打开跌停过滤
+```
+
+短标签含义：`lb` 回看天数、`dd` 连续下降清仓天数、`sl` 止损百分比、
+`ld` 打开跌停过滤、`norsrs` 跳过 RSRS。目录里包含：
 
 | 文件 | 内容 |
 |---|---|
@@ -76,7 +84,7 @@ RSRS 修正标准分（N=21, M=600, 沪深300）**只计算和打印，不参与
 |---|---|---|
 | `concept_sectors` | `('沪深A股',)` | `CONCEPT_SECTORS=['沪深a股']`（完整概念列表保留为 `CONCEPT_SECTORS_FULL`） |
 | `min_market_cap` / `max_market_cap` | 30亿 / 500亿 | `MIN_MARKET_CAP` / `MAX_MARKET_CAP` |
-| `lookback_days` | 5 | `LOOKBACK_DAYS = 5` |
+| `lookback_days` | 5 | `LOOKBACK_DAYS = 5`（原注释里另有 29） |
 | `trading_days_per_year` | 244 | `TRADING_DAYS_PER_YEAR` |
 | `rsrs_n` / `rsrs_m` | 21 / 600 | `RSRS_N` / `RSRS_M` |
 | `stop_loss_ratio` | -0.15 | `STOP_LOSS_RATIO` |
@@ -113,6 +121,7 @@ pip install -r requirements-dev.txt    # 加 pytest
 ```bash
 # 真实数据（Windows + QMT）
 python run_backtest.py --start 20240101 --end 20241231 --cash 200000
+python run_backtest.py --start 20240101 --end 20241231 --lookback 15 29   # 一次跑多组回看天数
 python run_backtest.py --start 20240101 --end 20241231 --download     # 先补下载日线（带进度条）
 python run_backtest.py --start 20240101 --end 20241231 --equity-csv equity.csv --deals-csv deals.csv
 
@@ -135,7 +144,17 @@ python run_backtest.py --check-data              # 逐步定位哪一环取不�
 python run_backtest.py --check-data --download   # 顺便试下载一只标的
 ```
 
-常用参数：`--lookback` 回看天数、`--stop-loss` 止损线、`--decline-days` 连续下降
+`--lookback` 可以给多个值，依次回测并在最后打印横向对比表，各自的结果写进
+以回看天数命名的独立目录：
+
+```
+  回看天数        期末资产     总收益       年化   最大回撤    夏普  交易笔数  卖出胜率
+  5 天             249,595     24.80%     35.02%    -16.92%    1.29       145     47.2%
+  15 天            162,416    -18.79%    -24.59%    -29.58%   -0.88        71     40.0%
+  29 天            276,436     38.22%     55.08%     -7.42%    1.98        34     58.8%
+```
+
+常用参数：`--lookback` 回看天数（可多值）、`--stop-loss` 止损线、`--decline-days` 连续下降
 清仓天数、`--min-cap/--max-cap` 市值区间、`--sectors` 板块（逗号分隔）、
 `--no-rsrs` 跳过 RSRS、`--no-cache` 关闭行情内存缓存、`--engine loop` 切回逐日引擎、
 `--out-dir` 指定结果目录、`--no-save` 不保存结果、`-q` 只输出进度条和最终统计，
@@ -177,11 +196,12 @@ momentum_strategy/
 python -m pytest
 ```
 
-121 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
+147 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
 「当日 K 线不参与打分」的未来函数检查）、股票池过滤、择时信号、T+1 与费用、
 调仓与止损、绩效统计，以及 xtdata 取数行为（分批、字段退回、无数据报错，
 用桩 xtquant 注入，不需要 QMT）、进度条渲染、
-向量化指标与 polyfit 的数值一致性、两个引擎的逐笔结果一致性、结果文件落盘。
+向量化指标与 polyfit 的数值一致性、两个引擎的逐笔结果一致性、结果文件落盘，
+以及命令行的结果目录命名与多组参数回测。
 
 ## 与原 QMT 脚本的差异
 

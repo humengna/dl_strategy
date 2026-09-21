@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+import unicodedata
 from dataclasses import asdict
 from datetime import datetime
 
@@ -38,7 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help='只做 xtdata 数据自检并退出（配合 --download 会试下载一只标的）')
 
     p.add_argument('--sectors', default='', help='板块名，逗号分隔，默认 ' + ','.join(CONCEPT_SECTORS_DEFAULT))
-    p.add_argument('--lookback', type=int, default=StrategyConfig.lookback_days, help='动量回看天数')
+    p.add_argument('--lookback', type=int, nargs='+', default=[StrategyConfig.lookback_days],
+                   metavar='N', help='动量回看天数，可给多个依次回测，例如 --lookback 15 29')
     p.add_argument('--stop-loss', type=float, default=StrategyConfig.stop_loss_ratio, help='止损线，如 -0.15')
     p.add_argument('--decline-days', type=int, default=StrategyConfig.decline_days_to_sell,
                    help='动量分数连续下降几天清仓')
@@ -80,6 +82,67 @@ def build_source(args):
     return XtDataSource(use_cache=not args.no_cache)
 
 
+def run_label(args, cfg: StrategyConfig) -> str:
+    """
+    回测结果目录名：起止日期 + 回看天数，非默认的关键参数再追加短标签，
+    这样不同参数的结果放在一起也能一眼区分。
+    例：bt_20240101_20241231_lb29_dd1_ld
+    """
+    default = StrategyConfig()
+    parts = [f'bt_{args.start}_{args.end}', f'lb{cfg.lookback_days}']
+
+    if cfg.decline_days_to_sell != default.decline_days_to_sell:
+        parts.append(f'dd{cfg.decline_days_to_sell}')
+    if cfg.stop_loss_ratio != default.stop_loss_ratio:
+        parts.append('sl%g' % round(abs(cfg.stop_loss_ratio) * 100, 4))
+    if cfg.filter_limit_down:
+        parts.append('ld')
+    if not cfg.rsrs_enabled:
+        parts.append('norsrs')
+    return '_'.join(parts)
+
+
+def suffix_path(path: str, tag: str) -> str:
+    """给单独指定的输出文件加参数后缀，避免多次回测互相覆盖"""
+    if not path or not tag:
+        return path
+    base, ext = os.path.splitext(path)
+    return f'{base}_{tag}{ext}'
+
+
+def display_width(text: str) -> int:
+    """中日韩字符在终端里占两列，按显示宽度算才能对齐"""
+    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in str(text))
+
+
+def pad(text: str, width: int, left: bool = False) -> str:
+    space = ' ' * max(0, width - display_width(text))
+    return (text + space) if left else (space + text)
+
+
+COMPARE_COLUMNS = (('回看天数', 10, True), ('期末资产', 13, False), ('总收益', 10, False),
+                   ('年化', 10, False), ('最大回撤', 10, False), ('夏普', 7, False),
+                   ('交易笔数', 9, False), ('卖出胜率', 9, False))
+
+
+def compare_table(rows) -> str:
+    """多组参数跑完后的横向对比"""
+    header = '  ' + ' '.join(pad(name, width, left) for name, width, left in COMPARE_COLUMNS)
+    lines = ['', '=' * display_width(header), '[参数对比]', '=' * display_width(header), header]
+
+    for label, perf in rows:
+        if perf is None:
+            lines.append('  ' + pad(label, COMPARE_COLUMNS[0][1], True) + ' 无有效交易日')
+            continue
+        values = [label, f'{perf.final_asset:,.0f}', f'{perf.total_return:.2%}',
+                  f'{perf.annual_return:.2%}', f'{perf.max_drawdown:.2%}',
+                  f'{perf.sharpe:.2f}', str(perf.buy_count + perf.sell_count),
+                  f'{perf.win_rate:.1%}']
+        lines.append('  ' + ' '.join(pad(v, w, left)
+                                     for v, (_, w, left) in zip(values, COMPARE_COLUMNS)))
+    return '\n'.join(lines)
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(not args.quiet)
@@ -93,58 +156,80 @@ def main(argv=None) -> int:
     sectors = tuple(s.strip() for s in args.sectors.split(',') if s.strip()) \
         or CONCEPT_SECTORS_DEFAULT
 
-    config = BacktestConfig(
-        start_date=args.start,
-        end_date=args.end,
-        strategy=StrategyConfig(
-            concept_sectors=sectors,
-            lookback_days=args.lookback,
-            stop_loss_ratio=args.stop_loss,
-            decline_days_to_sell=args.decline_days,
-            min_market_cap=args.min_cap,
-            max_market_cap=args.max_cap,
-            rsrs_enabled=not args.no_rsrs,
-            filter_limit_down=args.filter_limit_down,
-        ),
-        account=AccountConfig(
-            init_cash=args.cash,
-            commission_rate=args.commission,
-            min_commission=args.min_commission,
-            transfer_fee_rate=args.transfer_fee,
-            stamp_tax_rate=args.stamp_tax,
-        ),
-    )
-
+    lookbacks = list(dict.fromkeys(args.lookback))
+    multi = len(lookbacks) > 1
     engine_cls = VectorBacktestEngine if args.engine == 'fast' else BacktestEngine
-    engine = engine_cls(build_source(args), config)
+    stamp = datetime.now().strftime('%H%M%S')
+    summary = []
 
-    started = time.time()
-    result = engine.run(download=args.download, show_progress=args.quiet)
-    elapsed = time.time() - started
-
-    perf = evaluate(result, config.strategy.trading_days_per_year)
-    print(format_report(perf))
-    print(f'  回测耗时  : {elapsed:.1f} 秒（{args.engine} 引擎）')
-
-    if not args.no_save:
-        out_dir = args.out_dir or os.path.join(
-            'results', f'bt_{args.start}_{args.end}_{datetime.now().strftime("%H%M%S")}')
-        save_results(
-            result, out_dir, perf,
-            name_lookup=engine.source.get_stock_name,
-            extra={
-                'start_date': args.start,
-                'end_date': args.end,
-                'init_cash': args.cash,
-                'engine': args.engine,
-                'elapsed_seconds': round(elapsed, 2),
-                'sectors': list(sectors),
-                'strategy': asdict(config.strategy),
-                'account': asdict(config.account),
-            },
+    for n, lookback in enumerate(lookbacks, 1):
+        config = BacktestConfig(
+            start_date=args.start,
+            end_date=args.end,
+            strategy=StrategyConfig(
+                concept_sectors=sectors,
+                lookback_days=lookback,
+                stop_loss_ratio=args.stop_loss,
+                decline_days_to_sell=args.decline_days,
+                min_market_cap=args.min_cap,
+                max_market_cap=args.max_cap,
+                rsrs_enabled=not args.no_rsrs,
+                filter_limit_down=args.filter_limit_down,
+            ),
+            account=AccountConfig(
+                init_cash=args.cash,
+                commission_rate=args.commission,
+                min_commission=args.min_commission,
+                transfer_fee_rate=args.transfer_fee,
+                stamp_tax_rate=args.stamp_tax,
+            ),
         )
+        label = run_label(args, config.strategy)
 
-    save_csv(result, args.equity_csv, args.deals_csv)
+        if multi:
+            print('\n' + '=' * 78)
+            print(f'[回测 {n}/{len(lookbacks)}] 回看 {lookback} 天')
+            print('=' * 78)
+
+        engine = engine_cls(build_source(args), config)
+        started = time.time()
+        # 只有第一次需要补下载，后续几次数据已经在本地
+        result = engine.run(download=args.download and n == 1, show_progress=args.quiet)
+        elapsed = time.time() - started
+
+        perf = evaluate(result, config.strategy.trading_days_per_year)
+        print(format_report(perf))
+        print(f'  回看天数  : {lookback}')
+        print(f'  回测耗时  : {elapsed:.1f} 秒（{args.engine} 引擎）')
+
+        if not args.no_save:
+            if args.out_dir:
+                out_dir = os.path.join(args.out_dir, label) if multi else args.out_dir
+            else:
+                out_dir = os.path.join('results', f'{label}_{stamp}')
+            save_results(
+                result, out_dir, perf,
+                name_lookup=engine.source.get_stock_name,
+                extra={
+                    'label': label,
+                    'start_date': args.start,
+                    'end_date': args.end,
+                    'init_cash': args.cash,
+                    'engine': args.engine,
+                    'elapsed_seconds': round(elapsed, 2),
+                    'sectors': list(sectors),
+                    'strategy': asdict(config.strategy),
+                    'account': asdict(config.account),
+                },
+            )
+
+        tag = f'lb{lookback}' if multi else ''
+        save_csv(result, suffix_path(args.equity_csv, tag), suffix_path(args.deals_csv, tag))
+        summary.append((f'{lookback} 天', perf))
+
+    if multi:
+        print(compare_table(summary))
+
     return 0
 
 
