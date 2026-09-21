@@ -1,46 +1,205 @@
 # coding: utf-8
 """
-A股股票策略 [xtdata 版]：热门概念池 + 对数线性回归动量打分 + RSRS修正标准分大盘择时
-                        + 动量分数连续下降个股择时 + 固定 -15% 硬止损
+A股动量择时策略 [xtdata 单文件版]
 
-与 QMT 内置回测版（handlebar + passorder）的主要区别
---------------------------------------------------
-  1. 数据层全部改用 xtquant.xtdata，不再依赖策略上下文对象 C
-       C.get_market_data_ex        -> xtdata.get_market_data_ex
-       C.get_stock_list_in_sector  -> xtdata.get_stock_list_in_sector
-       C.get_instrument_detail     -> xtdata.get_instrument_detail
-       C.get_stock_name            -> xtdata.get_instrument_detail()['InstrumentName']
-  2. 驱动方式：不再用 handlebar 逐 K 线回调，改为按 xtdata.get_trading_dates
-     取到的交易日列表自行循环（一个交易日 = 原来的一根日 K）
-  3. 交易层：xtdata 只有行情没有交易，passorder / get_trade_detail_data
-     由本文件内的 SimAccount 模拟撮合账户替代（含 T+1、手续费、印花税）
-  4. 为避免每个交易日对全市场重复取数，默认一次性把回测区间内的行情读进内存缓存
-     （BacktestData），再按日期切片；可用 use_cache=False 退回逐日直接查询
-  5. 脚本可直接 python 运行，需要本机已启动 迅投QMT/投研端 并已下载好日线数据
+热门概念池 + 对数线性回归动量打分 + RSRS修正标准分 + 动量分数连续下降择时
++ 固定 -15% 硬止损。行情走 xtquant.xtdata，交易由内置 SimAccount 模拟撮合。
 
-运行方式
---------
+!! 本文件由 momentum_strategy/tools/build_standalone.py 自动生成，请勿直接修改 !!
+   改动请提交到 momentum_strategy/momentum/ 下的模块，再重新生成。
+
+运行
+----
   python dl_strategy_xtdata.py --start 20240101 --end 20241231 --cash 200000
-  首次运行本地缺数据时加 --download 先补下载（耗时较长）
+  python dl_strategy_xtdata.py --start 20240101 --end 20241231 --download
+  python dl_strategy_xtdata.py --check-data
+  结果默认保存到 results/bt_<起止日期>_<时间戳>/
 """
 
 import argparse
+import bisect
+import json
+import logging
 import math
-from datetime import datetime
-
 import numpy as np
+import os
 import pandas as pd
+import sys
+import time
+from collections import deque
+from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Callable, Dict, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional
+from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence
+from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
+from typing import Optional, TextIO
+from typing import Tuple
 
-from xtquant import xtdata
+# ======================================================================
+# progress.py
+# ======================================================================
 
-# ============================================================
-# 策略参数（与原版保持一致）
-# ============================================================
+"""
+终端进度条。
 
-STRATEGY_NAME = '动量择时策略'
+终端（tty）下用 \\r 原地刷新，重定向到文件时按百分比档位换行打印，
+这样日志文件里不会出现成千上万行刷屏。
+"""
 
-# 概念板块列表
-CONCEPT_SECTORS = [
+
+
+def format_duration(seconds: float) -> str:
+    """把秒数格式化成 mm:ss 或 h:mm:ss"""
+    if seconds is None or seconds != seconds or seconds in (float('inf'), float('-inf')) or seconds < 0:
+        return '--:--'
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f'{hours}:{minutes:02d}:{secs:02d}'
+    return f'{minutes:02d}:{secs:02d}'
+
+
+class Progress(object):
+    """
+    进度条。
+
+        bar = Progress(total=5224, prefix='下载日线')
+        for i, item in enumerate(items, 1):
+            ...
+            bar.update(i, suffix=item)
+        bar.close()
+    """
+
+    BAR_WIDTH = 24
+
+    def __init__(self, total: int, prefix: str = '', enabled: bool = True,
+                 stream: Optional[TextIO] = None, min_interval: float = 0.2,
+                 step_percent: int = 10):
+        self.total = max(int(total or 0), 0)
+        self.prefix = prefix
+        self.stream = stream if stream is not None else sys.stdout
+        self.enabled = bool(enabled) and self.total > 0
+        self.min_interval = min_interval          # tty 下两次刷新的最小间隔
+        self.step_percent = max(int(step_percent), 1)   # 非 tty 下每多少百分点打一行
+
+        self.start_time = time.time()
+        self.tty = bool(getattr(self.stream, 'isatty', lambda: False)())
+        self._done = 0
+        self._last_render = 0.0
+        self._last_bucket = -1
+        self._max_len = 0
+        self._rendered_done = -1
+        self._closed = False
+
+    # ---------- 对外 ----------
+
+    def update(self, done: int, suffix: str = '', force: bool = False) -> None:
+        self._done = max(int(done), 0)
+        if not self.enabled or self._closed:
+            return
+        if not force and not self._should_render():
+            return
+        self._write(self._render(suffix))
+
+    def advance(self, step: int = 1, suffix: str = '') -> None:
+        self.update(self._done + step, suffix)
+
+    def close(self, suffix: str = '') -> None:
+        if self._closed:
+            return
+        # 非 tty 下最后一行已经打过就不再重复
+        if self.enabled and (self.tty or self._rendered_done != self._done):
+            self._write(self._render(suffix), final=True)
+        self._closed = True
+
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self.start_time
+
+    # ---------- 内部 ----------
+
+    def _should_render(self) -> bool:
+        now = time.time()
+        if self._done >= self.total:
+            return True
+        if self.tty:
+            if now - self._last_render < self.min_interval:
+                return False
+            self._last_render = now
+            return True
+
+        bucket = int(self._percent() // self.step_percent)
+        if bucket <= self._last_bucket:
+            return False
+        self._last_bucket = bucket
+        self._last_render = now
+        return True
+
+    def _percent(self) -> float:
+        if not self.total:
+            return 100.0
+        return min(100.0 * self._done / self.total, 100.0)
+
+    def _eta(self) -> float:
+        if self._done <= 0 or self._done >= self.total:
+            return 0.0
+        return self.elapsed / self._done * (self.total - self._done)
+
+    def _render(self, suffix: str) -> str:
+        pct = self._percent()
+        filled = int(self.BAR_WIDTH * pct / 100)
+        bar = '#' * filled + '-' * (self.BAR_WIDTH - filled)
+
+        parts = []
+        if self.prefix:
+            parts.append(self.prefix)
+        parts.append(f'[{bar}]')
+        parts.append(f'{pct:5.1f}%')
+        parts.append(f'{self._done}/{self.total}')
+        parts.append(f'已用 {format_duration(self.elapsed)}')
+        if self._done < self.total:
+            parts.append(f'剩余 {format_duration(self._eta())}')
+        if suffix:
+            parts.append(str(suffix))
+        return ' '.join(parts)
+
+    def _write(self, line: str, final: bool = False) -> None:
+        self._rendered_done = self._done
+        self._max_len = max(self._max_len, len(line))
+        if self.tty:
+            self.stream.write('\r' + line.ljust(self._max_len))
+            if final:
+                self.stream.write('\n')
+        else:
+            self.stream.write(line + '\n')
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+
+
+# ======================================================================
+# config.py
+# ======================================================================
+
+"""策略参数。数值全部取自原 QMT 回测脚本 dl_strategy.py，未做调整。"""
+
+
+# ------------------------------------------------------------
+# 概念板块列表（原脚本中的完整列表）
+# ------------------------------------------------------------
+CONCEPT_SECTORS_FULL: Tuple[str, ...] = (
     '锂电池', '芯片', '人工智能', '光伏', '军工', '新能源车', '储能',
     '5G', '半导体', '国产软件', '云计算', '大数据', '物联网', '机器人',
     '氢能源', '风能', '核电', '特高压', '充电桩', '智能电网', '工业互联网',
@@ -51,284 +210,193 @@ CONCEPT_SECTORS = [
     '卫星导航', '大飞机', '军民融合', '一带一路', '雄安新区', '海南自贸',
     '碳中和', '环保', '固废处理', '污水处理', '垃圾分类',
     '网络安全', '信创', '东数西算', '量子科技', '脑机接口',
-]
-CONCEPT_SECTORS = ['沪深A股']
+)
 
-# 过滤条件
-MIN_MARKET_CAP = 30e8
-MAX_MARKET_CAP = 500e8
+# 原脚本最后一行把板块覆盖成全市场：CONCEPT_SECTORS = ['沪深a股']
+# xtdata 中板块名为 '沪深A股'（大写 A），这里沿用同一含义
+CONCEPT_SECTORS_DEFAULT: Tuple[str, ...] = ('沪深A股',)
 
-# 动量打分参数
-LOOKBACK_DAYS = 5          # 29
-TRADING_DAYS_PER_YEAR = 244
-
-# RSRS 参数
-RSRS_N = 21
-RSRS_M = 600
-RSRS_INDEX = '000300.SH'
-
-# 止损线
-STOP_LOSS_RATIO = -0.15
-
-# 预热天数：前若干个交易日数据不足，不参与交易（对应原版 bar_count < LOOKBACK_DAYS + 10）
-WARMUP_DAYS = LOOKBACK_DAYS + 10
-
-# 行情字段
-DAILY_FIELDS = ['open', 'high', 'low', 'close', 'preClose', 'volume', 'suspendFlag']
-
-# 交易成本
-COMMISSION_RATE = 2.5e-4   # 佣金万 2.5
-MIN_COMMISSION = 5.0       # 单笔最低 5 元
-STAMP_TAX_RATE = 5e-4      # 卖出印花税万 5
+# 日线字段
+DAILY_FIELDS = ('open', 'high', 'low', 'close', 'preClose', 'volume', 'suspendFlag')
 
 
-# ============================================================
-# 模拟账户：替代 get_trade_detail_data / passorder
-# ============================================================
+@dataclass
+class StrategyConfig:
+    """选股 / 择时 / 风控参数"""
 
-class Position(object):
-    """持仓。open_price 对应原版 m_dOpenPrice（成本价），can_use 对应 m_nCanUseVolume（T+1 可卖量）"""
+    # 股票池
+    concept_sectors: Tuple[str, ...] = CONCEPT_SECTORS_DEFAULT
+    min_market_cap: float = 30e8           # 市值下限
+    max_market_cap: float = 500e8          # 市值上限
+    exclude_st: bool = True
+    # 原脚本中被注释掉的创业板 / 科创板剔除开关
+    exclude_gem: bool = False              # 300 / 301
+    exclude_star: bool = False             # 688
 
-    def __init__(self, stock, volume, price):
-        self.stock = stock
-        self.volume = volume
-        self.can_use = 0          # 当日买入不可卖，次日开盘结算
-        self.open_price = price
+    # 动量打分
+    lookback_days: int = 5                 # 原脚本 LOOKBACK_DAYS = 5（注释里另有 29）
+    trading_days_per_year: int = 244
+
+    # 动量分数序列长度（原脚本固定取 5，再补最新 1 个，共 6 个）
+    score_series_len: int = 5
+
+    # 择时：动量分数连续下降达到该天数则清仓
+    decline_days_to_sell: int = 2
+    # 判定「下降」的最小幅度。0.0 = 与原脚本一致的严格比较；
+    # 分数几乎相等时（例如价格走势非常接近完美指数增长），
+    # 严格比较会把 1e-13 级别的浮点噪声当成下降，可设一个相对容差规避。
+    decline_epsilon: float = 0.0
+
+    # RSRS（仅打印，不参与决策，与原脚本一致）
+    rsrs_n: int = 21
+    rsrs_m: int = 600
+    rsrs_index: str = '000300.SH'
+    rsrs_enabled: bool = True
+
+    # 风控
+    stop_loss_ratio: float = -0.15         # 固定硬止损线
+
+    # 预热：原脚本 bar_count < LOOKBACK_DAYS + 10 时不交易
+    warmup_days: int = 0                   # 0 表示按 lookback_days + 10 自动计算
+
+    # 跌停判断：True 按代码前缀区分 10%/20%；False 沿用原脚本固定 10%
+    dynamic_limit_down: bool = True
+
+    def __post_init__(self):
+        if self.warmup_days <= 0:
+            self.warmup_days = self.lookback_days + 10
+
+    @property
+    def bars_needed_for_rank(self) -> int:
+        """排序打分需要的 K 线根数（多取 1 根用于排除当前 bar）"""
+        return self.lookback_days + 2
+
+    @property
+    def bars_needed_for_series(self) -> int:
+        return self.lookback_days + self.score_series_len + 2
+
+    @property
+    def bars_needed_for_rsrs(self) -> int:
+        return self.rsrs_m + self.rsrs_n + 2
 
 
-class Deal(object):
-    def __init__(self, date, stock, direction, price, volume, fee, msg):
-        self.date = date
-        self.stock = stock
-        self.direction = direction    # 1 买入 / -1 卖出
-        self.price = price
-        self.volume = volume
-        self.fee = fee
-        self.msg = msg
+@dataclass
+class AccountConfig:
+    """模拟账户参数"""
+
+    init_cash: float = 200000.0
+    commission_rate: float = 2.5e-4        # 佣金万 2.5
+    min_commission: float = 5.0            # 单笔最低 5 元
+    stamp_tax_rate: float = 5e-4           # 卖出印花税万 5
+    lot_size: int = 100                    # 一手股数
+    t_plus_one: bool = True                # 当日买入次日才可卖
 
 
-class SimAccount(object):
+@dataclass
+class BacktestConfig:
+    """回测运行参数"""
+
+    start_date: str = '20240101'
+    end_date: str = '20241231'
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    account: AccountConfig = field(default_factory=AccountConfig)
+
+
+# ======================================================================
+# indicators.py
+# ======================================================================
+
+"""指标计算：一元线性回归、对数价格动量分数、RSRS 修正标准分。"""
+
+
+
+
+def linear_regression(x: Sequence[float], y: Sequence[float]) -> Tuple[float, float]:
+    """numpy.polyfit 一元线性回归，返回 (slope, r_squared)"""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(x) < 2 or len(x) != len(y):
+        return 0.0, 0.0
+
+    slope, intercept = np.polyfit(x, y, 1)
+    y_pred = slope * x + intercept
+    ss_res = float(np.sum((y - y_pred) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    return float(slope), float(r2)
+
+
+def momentum_score(close_prices: Sequence[float],
+                   trading_days_per_year: int = 244) -> Optional[float]:
     """
-    极简模拟股票账户：
-      - T+1：当日买入次日才计入 can_use
-      - 按成交额收佣金（最低 5 元），卖出额外收印花税
-      - 以传入价格立即全额成交（不模拟盘口冲击）
+    动量分数 = 年化收益率 * |R2|
+    对对数收盘价做线性回归，斜率年化后乘以拟合优度。
+    数据不足或含非正数价格时返回 None；R2 <= 0 时返回 0.0（与原脚本一致）。
     """
+    prices = np.asarray(close_prices, dtype=float)
+    if len(prices) < 2 or np.any(np.isnan(prices)) or np.any(prices <= 0):
+        return None
 
-    def __init__(self, init_cash):
-        self.init_cash = float(init_cash)
-        self.cash = float(init_cash)
-        self.positions = {}      # stock -> Position
-        self.deals = []          # 全部成交
-        self.equity_curve = []   # [(date, total_asset)]
+    log_prices = np.log(prices)
+    x = np.arange(len(log_prices), dtype=float)
 
-    # ---------- 查询（对应 get_trade_detail_data） ----------
+    try:
+        slope, r2 = linear_regression(x, log_prices)
+    except Exception:
+        return None
 
-    def get_positions(self):
-        return [p for p in self.positions.values() if p.volume > 0]
+    if r2 <= 0:
+        return 0.0
 
-    def get_holdings_can_use(self):
-        """返回 {stock: 可用数量}，对应原版遍历 m_nCanUseVolume 的结果"""
-        return {s: p.can_use for s, p in self.positions.items() if p.can_use > 0}
-
-    def settle_open(self):
-        """每个交易日开盘前调用：解冻昨日买入的股票（T+1）"""
-        for pos in self.positions.values():
-            pos.can_use = pos.volume
-
-    # ---------- 交易（对应 passorder） ----------
-
-    def buy(self, date, stock, price, volume, msg=''):
-        if volume <= 0 or price <= 0:
-            return False
-        amount = price * volume
-        fee = max(amount * COMMISSION_RATE, MIN_COMMISSION)
-        if amount + fee > self.cash + 1e-6:
-            print(f'[账户] 资金不足，买入失败 {stock} 需要:{amount + fee:.2f} 可用:{self.cash:.2f}')
-            return False
-
-        self.cash -= amount + fee
-        pos = self.positions.get(stock)
-        if pos is None:
-            self.positions[stock] = Position(stock, volume, price)
-        else:
-            total_cost = pos.open_price * pos.volume + amount
-            pos.volume += volume
-            pos.open_price = total_cost / pos.volume
-        self.deals.append(Deal(date, stock, 1, price, volume, fee, msg))
-        print(f'[账户] 买入成交 {stock} 价格:{price:.2f} 数量:{volume} 费用:{fee:.2f} 余额:{self.cash:.2f}')
-        return True
-
-    def sell(self, date, stock, price, volume, msg=''):
-        pos = self.positions.get(stock)
-        if pos is None or volume <= 0 or price <= 0:
-            return False
-        volume = min(volume, pos.can_use)
-        if volume <= 0:
-            print(f'[账户] {stock} 无可用数量，卖出跳过（T+1）')
-            return False
-
-        amount = price * volume
-        fee = max(amount * COMMISSION_RATE, MIN_COMMISSION) + amount * STAMP_TAX_RATE
-        self.cash += amount - fee
-        pos.volume -= volume
-        pos.can_use -= volume
-        if pos.volume <= 0:
-            del self.positions[stock]
-        self.deals.append(Deal(date, stock, -1, price, volume, fee, msg))
-        print(f'[账户] 卖出成交 {stock} 价格:{price:.2f} 数量:{volume} 费用:{fee:.2f} 余额:{self.cash:.2f}')
-        return True
-
-    # ---------- 估值 ----------
-
-    def total_asset(self, price_map):
-        mv = 0.0
-        for stock, pos in self.positions.items():
-            px = price_map.get(stock, pos.open_price)
-            if px and px > 0:
-                mv += px * pos.volume
-            else:
-                mv += pos.open_price * pos.volume
-        return self.cash + mv
+    annual_return = np.exp(slope * trading_days_per_year) - 1
+    return float(annual_return * abs(r2))
 
 
-# ============================================================
-# 数据层：xtdata 读取 + 内存缓存
-# ============================================================
-
-class BacktestData(object):
+def rsrs_score(highs: Sequence[float], lows: Sequence[float],
+               n: int = 21, m: int = 600) -> Optional[float]:
     """
-    统一封装 xtdata 行情读取。
-
-    use_cache=True 时，一次性把 [warmup_start, end] 区间的日线读进内存，
-    之后按 end_date/count 切片，避免逐日对全市场反复调用 get_market_data_ex。
+    RSRS 修正标准分：
+      1. 每 n 根 K 线用最低价回归最高价，取斜率 beta 与 R2
+      2. 最近 m 个 beta 求 zscore
+      3. zscore * 最新 R2
+    数据不足返回 None。
     """
+    highs = np.asarray(highs, dtype=float)
+    lows = np.asarray(lows, dtype=float)
+    if len(highs) < n + m or len(highs) != len(lows):
+        return None
 
-    def __init__(self, use_cache=True):
-        self.use_cache = use_cache
-        self._cache = {}            # stock -> DataFrame(index=日期字符串)
-        self._detail_cache = {}     # stock -> instrument detail dict
-        self._name_cache = {}
-
-    # ---------- 缓存预加载 ----------
-
-    def preload(self, stocks, start_date, end_date, fields=None):
-        if not self.use_cache or not stocks:
-            return
-        fields = fields or DAILY_FIELDS
-        stocks = list(dict.fromkeys(stocks))
-        print(f'[数据] 预加载行情: {len(stocks)} 只, {start_date} ~ {end_date} ...')
-        data = xtdata.get_market_data_ex(
-            fields, stocks,
-            period='1d',
-            start_time=start_date,
-            end_time=end_date,
-            dividend_type='none',
-            fill_data=True,
-        )
-        loaded = 0
-        for stock in stocks:
-            df = data.get(stock)
-            if df is None or len(df) == 0:
-                continue
-            df = df.copy()
-            df.index = [str(i) for i in df.index]
-            self._cache[stock] = df
-            loaded += 1
-        print(f'[数据] 预加载完成: {loaded} 只有数据')
-
-    # ---------- 行情查询（对应 C.get_market_data_ex） ----------
-
-    def get_bars(self, stocks, end_date, count, fields=None):
-        """
-        返回 {stock: DataFrame}，DataFrame 为截至 end_date（含）的最后 count 根日线。
-        无数据的标的不出现在返回值中。
-        """
-        fields = fields or DAILY_FIELDS
-        if isinstance(stocks, str):
-            stocks = [stocks]
-
-        result = {}
-        missing = []
-        if self.use_cache:
-            for stock in stocks:
-                df = self._cache.get(stock)
-                if df is None:
-                    missing.append(stock)
-                    continue
-                sub = df.loc[df.index <= end_date]
-                if count and count > 0:
-                    sub = sub.tail(count)
-                if len(sub) > 0:
-                    result[stock] = sub
-            if not missing:
-                return result
-        else:
-            missing = list(stocks)
-
-        # 缓存未命中（或关闭缓存）时直接查 xtdata
+    betas = []
+    r2_list = []
+    for i in range(n - 1, len(highs)):
+        h = highs[i - n + 1:i + 1]
+        l = lows[i - n + 1:i + 1]
+        if len(h) < n or np.any(np.isnan(h)) or np.any(np.isnan(l)):
+            continue
         try:
-            data = xtdata.get_market_data_ex(
-                fields, missing,
-                period='1d',
-                end_time=end_date,
-                count=count,
-                dividend_type='none',
-                fill_data=True,
-            )
-        except Exception as e:
-            print(f'[数据] get_market_data_ex 失败: {e}')
-            return result
-
-        for stock in missing:
-            df = data.get(stock)
-            if df is None or len(df) == 0:
-                continue
-            df = df.copy()
-            df.index = [str(i) for i in df.index]
-            result[stock] = df
-        return result
-
-    def get_one(self, stock, end_date, count, fields=None):
-        """单只标的的便捷查询，返回 DataFrame 或 None"""
-        data = self.get_bars([stock], end_date, count, fields)
-        df = data.get(stock)
-        if df is None or len(df) == 0:
-            return None
-        return df
-
-    # ---------- 合约信息（对应 C.get_instrument_detail / get_stock_name） ----------
-
-    def get_detail(self, stock):
-        if stock in self._detail_cache:
-            return self._detail_cache[stock]
-        try:
-            detail = xtdata.get_instrument_detail(stock)
+            slope, r2 = linear_regression(l, h)
         except Exception:
-            detail = None
-        self._detail_cache[stock] = detail
-        return detail
+            continue
+        betas.append(slope)
+        r2_list.append(r2)
 
-    def get_stock_name(self, stock):
-        if stock in self._name_cache:
-            return self._name_cache[stock]
-        detail = self.get_detail(stock)
-        name = ''
-        if detail:
-            name = detail.get('InstrumentName', '') or ''
-        self._name_cache[stock] = name
-        return name
+    if len(betas) < m:
+        return None
+
+    recent = np.asarray(betas[-m:], dtype=float)
+    std = float(np.std(recent))
+    if std == 0:
+        return 0.0
+
+    zscore = (recent[-1] - float(np.mean(recent))) / std
+    recent_r2 = r2_list[-1] if r2_list else 0.0
+    return float(zscore * recent_r2)
 
 
-# ============================================================
-# 通用工具
-# ============================================================
-
-def get_limit_ratio(stock):
+def limit_ratio(stock: str) -> float:
     """
-    根据代码前缀确定涨跌停幅度：
-      创业板(300/301)、科创板(688) -> 20%
-      主板(60/00) -> 10%
+    涨跌停幅度：创业板(300/301)、科创板(688) 为 20%，主板为 10%
     """
     code = stock.split('.')[0]
     if code.startswith(('300', '301', '688')):
@@ -336,82 +404,924 @@ def get_limit_ratio(stock):
     return 0.10
 
 
-def get_price_and_limits(stock, data, bar_date):
+# ======================================================================
+# panel.py
+# ======================================================================
+
+"""
+向量化行情面板与滚动指标核。
+
+逐日、逐股票地切 DataFrame 再调 np.polyfit 是回测最大的开销：
+5000 只 × 250 个交易日 = 125 万次回归。这里把行情拉平成
+(交易日 × 标的) 的 numpy 矩阵，再用滚动求和一次性算出所有格子的
+动量分数，把 125 万次回归压缩成几次矩阵运算。
+
+关键恒等式（一元线性回归）：
+    slope = (L*Sxy - Sx*Sy) / (L*Sxx - Sx^2)
+    R^2   = (L*Sxy - Sx*Sy)^2 / ((L*Sxx - Sx^2) * (L*Sy2 - Sy^2))
+其中 S* 都是窗口内的和，可以用 cumsum 在 O(n) 内滚动求出。
+slope 和 R^2 对 x、y 各自平移不变，所以计算前先减去列均值，
+避免大数相减的精度损失（和 polyfit 的结果对齐到 1e-9 以内）。
+"""
+
+
+
+
+
+# ============================================================
+# 滚动求和 / 滚动回归
+# ============================================================
+
+def _rolling_sum(a: np.ndarray, window: int) -> np.ndarray:
+    """第 i 行 = a[i-window+1 : i+1] 的和，前 window-1 行为 nan。a 不得含 nan。"""
+    out = np.full(a.shape, np.nan)
+    n = a.shape[0]
+    if n < window or window < 1:
+        return out
+
+    cum = np.cumsum(a, axis=0)
+    head = np.zeros((1,) + a.shape[1:], dtype=float)
+    out[window - 1:] = cum[window - 1:] - np.concatenate([head, cum[:n - window]], axis=0)
+    return out
+
+
+def rolling_linreg_fixed_x(y: np.ndarray, window: int
+                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    获取某股票当日开盘价、涨停价、跌停价、最低价。
-    涨跌停比例按代码前缀动态确定。
-    拿不到时统一返回 (0.0, 0.0, 0.0, 0.0)。
+    对每个滚动窗口做 y ~ x 回归，x 固定为 0..window-1。
+
+    返回 (slope, r2, ok)，形状与 y 相同；第 i 行对应窗口 y[i-window+1 : i+1]。
+    ok 表示该窗口内所有值都有效（非 nan）。
     """
-    df = data.get_one(stock, bar_date, 1)
-    if df is None:
-        return 0.0, 0.0, 0.0, 0.0
-
-    open_price = float(df['open'].iloc[-1])
-    low_price = float(df['low'].iloc[-1])
-    pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else open_price
-    if pre_close <= 0:
-        return open_price, 0.0, 0.0, low_price
-
-    ratio = get_limit_ratio(stock)
-    limit_up = round(pre_close * (1 + ratio), 2)
-    limit_down = round(pre_close * (1 - ratio), 2)
-    return open_price, limit_up, limit_down, low_price
-
-
-def linear_regression(x, y):
-    """numpy.polyfit 一元线性回归，返回 (slope, r_squared)"""
-    x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    if len(x) < 2:
-        return 0.0, 0.0
+    squeeze = y.ndim == 1
+    if squeeze:
+        y = y.reshape(-1, 1)
 
-    slope, intercept = np.polyfit(x, y, 1)
-    y_pred = slope * x + intercept
-    ss_res = np.sum((y - y_pred) ** 2)
-    ss_tot = np.sum((y - np.mean(y)) ** 2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    n, m = y.shape
+    nan = np.full((n, m), np.nan)
+    if n < window or window < 2:
+        return nan, nan.copy(), np.zeros((n, m), dtype=bool)
 
-    return float(slope), float(r2)
+    valid = np.isfinite(y)
+    # 平移不改变 slope / R2，减去列均值以降低大数相减的精度损失
+    with np.errstate(invalid='ignore'):
+        center = np.nanmean(np.where(valid, y, np.nan), axis=0)
+    center = np.where(np.isfinite(center), center, 0.0)
+    yy = np.where(valid, y - center, 0.0)
+
+    count = _rolling_sum(valid.astype(float), window)
+    sum_y = _rolling_sum(yy, window)
+    sum_y2 = _rolling_sum(yy * yy, window)
+
+    # Sxy = Σ k * y_k，k 为窗口内位置；window 很小，直接累加 window 次向量化位移
+    acc = np.zeros((n - window + 1, m))
+    for k in range(window):
+        acc += k * yy[k:n - window + 1 + k]
+    sum_xy = np.full((n, m), np.nan)
+    sum_xy[window - 1:] = acc
+
+    length = float(window)
+    sum_x = length * (length - 1) / 2.0
+    sum_xx = (length - 1) * length * (2 * length - 1) / 6.0
+    den_x = length * sum_xx - sum_x * sum_x
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        num = length * sum_xy - sum_x * sum_y
+        den_y = length * sum_y2 - sum_y * sum_y
+        slope = num / den_x
+        r2 = np.where(den_y > 0, num * num / (den_x * den_y), 0.0)
+
+    ok = count >= window - 1e-9
+    slope = np.where(ok, slope, np.nan)
+    r2 = np.where(ok, r2, np.nan)
+
+    if squeeze:
+        return slope.ravel(), r2.ravel(), ok.ravel()
+    return slope, r2, ok
 
 
-def calc_momentum_score(close_prices):
+def rolling_linreg_xy(x: np.ndarray, y: np.ndarray, window: int
+                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """x、y 都随窗口变化的滚动回归（RSRS 用最低价回归最高价）。"""
+    x = np.asarray(x, dtype=float).reshape(-1, 1)
+    y = np.asarray(y, dtype=float).reshape(-1, 1)
+
+    n = x.shape[0]
+    nan = np.full(n, np.nan)
+    if n < window or window < 2:
+        return nan, nan.copy(), np.zeros(n, dtype=bool)
+
+    valid = np.isfinite(x) & np.isfinite(y)
+    with np.errstate(invalid='ignore'):
+        cx = np.nanmean(np.where(valid, x, np.nan))
+        cy = np.nanmean(np.where(valid, y, np.nan))
+    cx = cx if np.isfinite(cx) else 0.0
+    cy = cy if np.isfinite(cy) else 0.0
+
+    xx = np.where(valid, x - cx, 0.0)
+    yy = np.where(valid, y - cy, 0.0)
+
+    count = _rolling_sum(valid.astype(float), window)
+    sum_x = _rolling_sum(xx, window)
+    sum_y = _rolling_sum(yy, window)
+    sum_xx = _rolling_sum(xx * xx, window)
+    sum_yy = _rolling_sum(yy * yy, window)
+    sum_xy = _rolling_sum(xx * yy, window)
+
+    length = float(window)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        num = length * sum_xy - sum_x * sum_y
+        den_x = length * sum_xx - sum_x * sum_x
+        den_y = length * sum_yy - sum_y * sum_y
+        slope = np.where(den_x > 0, num / den_x, np.nan)
+        r2 = np.where((den_x > 0) & (den_y > 0), num * num / (den_x * den_y), 0.0)
+
+    ok = (count >= window - 1e-9)
+    slope = np.where(ok, slope, np.nan)
+    r2 = np.where(ok, r2, np.nan)
+    return slope.ravel(), r2.ravel(), ok.ravel()
+
+
+# ============================================================
+# 策略指标矩阵
+# ============================================================
+
+def momentum_score_matrix(close: np.ndarray, lookback: int,
+                          trading_days_per_year: int = 244) -> np.ndarray:
     """
-    动量分数 = 年化收益率 * |R2|
-    对对数价格做线性回归
+    动量分数矩阵。out[i, j] = 用 close[i-lookback : i, j]（不含第 i 行）算出的分数，
+    与逐日调用 momentum_score(收盘价窗口) 等价。
+
+    窗口内有非正价或缺失 -> nan（排名时剔除）；价格完全走平 -> 0.0。
     """
-    close_prices = np.asarray(close_prices, dtype=float)
-    if len(close_prices) < 2 or np.any(close_prices <= 0):
+    close = np.asarray(close, dtype=float)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        logp = np.log(np.where(close > 0, close, np.nan))
+
+    slope, r2, ok = rolling_linreg_fixed_x(logp, lookback)
+    with np.errstate(over='ignore', invalid='ignore'):
+        score = (np.exp(slope * trading_days_per_year) - 1.0) * np.abs(r2)
+    score = np.where(ok, score, np.nan)
+    score = np.where(ok & (r2 <= 0), 0.0, score)
+
+    out = np.full(score.shape, np.nan)
+    out[1:] = score[:-1]          # 排除当日：第 i 行用到 i-1 结束的窗口
+    return out
+
+
+def rsrs_series(high: np.ndarray, low: np.ndarray, n: int, m: int) -> np.ndarray:
+    """
+    RSRS 修正标准分序列。out[i] = 截至 i-1（不含当日）的 RSRS 值，
+    与逐日调用 rsrs_score(high[:i], low[:i]) 等价。
+    """
+    beta, r2, ok = rolling_linreg_xy(low, high, n)
+
+    valid = np.isfinite(beta)
+    beta0 = np.where(valid, beta, 0.0).reshape(-1, 1)
+    count = _rolling_sum(valid.astype(float).reshape(-1, 1), m).ravel()
+    sum_b = _rolling_sum(beta0, m).ravel()
+    sum_b2 = _rolling_sum(beta0 * beta0, m).ravel()
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mean = sum_b / m
+        var = sum_b2 / m - mean * mean
+        std = np.sqrt(np.where(var > 0, var, np.nan))
+        z = np.where(std > 0, (beta - mean) / std, 0.0)
+        value = z * r2
+
+    enough = np.isfinite(count) & (count >= m - 1e-9) & ok
+    value = np.where(enough, value, np.nan)
+
+    out = np.full(len(value), np.nan)
+    out[1:] = value[:-1]          # 排除当日
+    return out
+
+
+# ============================================================
+# 行情面板
+# ============================================================
+
+class Panel(object):
+    """(交易日 × 标的) 的行情矩阵集合"""
+
+    def __init__(self, dates: Sequence[str], stocks: Sequence[str],
+                 arrays: Dict[str, np.ndarray]):
+        self.dates = list(dates)
+        self.stocks = list(stocks)
+        self.arrays = arrays
+        self.date_pos = {d: i for i, d in enumerate(self.dates)}
+        self.stock_pos = {s: j for j, s in enumerate(self.stocks)}
+
+    # ---------- 访问 ----------
+
+    def __len__(self) -> int:
+        return len(self.dates)
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return len(self.dates), len(self.stocks)
+
+    def has(self, field: str) -> bool:
+        return field in self.arrays
+
+    def field(self, name: str) -> Optional[np.ndarray]:
+        return self.arrays.get(name)
+
+    def row(self, field: str, i: int) -> Optional[np.ndarray]:
+        arr = self.arrays.get(field)
+        return None if arr is None else arr[i]
+
+    def index_of(self, date: str) -> int:
+        """date 所在行；不是交易日时取其之前最近的一行，早于起点返回 -1"""
+        pos = self.date_pos.get(date)
+        if pos is not None:
+            return pos
+        i = bisect.bisect_right(self.dates, date) - 1
+        return i
+
+    def value(self, field: str, i: int, j: int) -> float:
+        arr = self.arrays.get(field)
+        if arr is None or i < 0 or j < 0:
+            return float('nan')
+        return float(arr[i, j])
+
+    # ---------- 构造 ----------
+
+    @classmethod
+    def from_frames(cls, frames: Dict[str, pd.DataFrame],
+                    fields: Sequence[str] = DAILY_FIELDS,
+                    start_date: str = '', end_date: str = '') -> 'Panel':
+        stocks = [s for s in frames if frames[s] is not None and len(frames[s]) > 0]
+        stocks.sort()
+
+        all_dates = set()
+        for stock in stocks:
+            all_dates.update(str(d)[:8] for d in frames[stock].index)
+        dates = sorted(d for d in all_dates
+                       if (not start_date or d >= start_date) and (not end_date or d <= end_date))
+
+        n, m = len(dates), len(stocks)
+        pos = {d: i for i, d in enumerate(dates)}
+        available = set()
+        for stock in stocks:
+            available.update(frames[stock].columns)
+        use_fields = [f for f in fields if f in available]
+
+        arrays = {f: np.full((n, m), np.nan) for f in use_fields}
+        for j, stock in enumerate(stocks):
+            df = frames[stock]
+            idx = [str(d)[:8] for d in df.index]
+            rows = np.array([pos.get(d, -1) for d in idx])
+            keep = rows >= 0
+            if not keep.any():
+                continue
+            rows = rows[keep]
+            for f in use_fields:
+                if f not in df.columns:
+                    continue
+                values = pd.to_numeric(df[f], errors='coerce').to_numpy(dtype=float)
+                arrays[f][rows, j] = values[keep]
+
+        return cls(dates, stocks, arrays)
+
+    @classmethod
+    def from_source(cls, source, stocks: Sequence[str], start_date: str, end_date: str,
+                    fields: Sequence[str] = DAILY_FIELDS) -> 'Panel':
+        frames = source.get_bars(list(stocks), end_date, 0, fields)
+        return cls.from_frames(frames, fields, start_date, end_date)
+
+
+# ======================================================================
+# broker.py
+# ======================================================================
+
+"""
+模拟撮合账户。
+
+xtdata 只提供行情，没有交易接口，所以原脚本里的
+get_trade_detail_data / passorder 由这里替代：
+  - T+1：当日买入次日才计入可用数量
+  - 佣金按成交额收取，单笔有最低值；卖出额外收印花税
+  - 以给定价格立即全额成交，不模拟盘口冲击和滑点
+"""
+
+
+
+log = logging.getLogger(__name__)
+
+BUY = 1
+SELL = -1
+
+
+@dataclass
+class Position:
+    """持仓。open_price 对应 QMT 的 m_dOpenPrice，can_use 对应 m_nCanUseVolume"""
+
+    stock: str
+    volume: int
+    open_price: float
+    can_use: int = 0
+
+
+@dataclass
+class Deal:
+    """成交记录。realized_pnl 仅卖出时有意义（已扣除本次费用）"""
+
+    date: str
+    stock: str
+    direction: int
+    price: float
+    volume: int
+    fee: float
+    msg: str = ''
+    realized_pnl: float = 0.0
+
+
+@dataclass
+class SimAccount:
+    cfg: AccountConfig = field(default_factory=AccountConfig)
+    cash: float = 0.0
+    positions: Dict[str, Position] = field(default_factory=dict)
+    deals: List[Deal] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.cash <= 0:
+            self.cash = float(self.cfg.init_cash)
+
+    # ---------- 查询 ----------
+
+    @property
+    def init_cash(self) -> float:
+        return float(self.cfg.init_cash)
+
+    def get_positions(self) -> List[Position]:
+        return [p for p in self.positions.values() if p.volume > 0]
+
+    def holdings_can_use(self) -> Dict[str, int]:
+        """{股票: 可卖数量}"""
+        return {s: p.can_use for s, p in self.positions.items() if p.can_use > 0}
+
+    def settle_open(self) -> None:
+        """每个交易日开盘前调用：解冻昨日买入（T+1）"""
+        for pos in self.positions.values():
+            pos.can_use = pos.volume
+
+    def total_asset(self, price_map: Optional[Dict[str, float]] = None) -> float:
+        price_map = price_map or {}
+        market_value = 0.0
+        for stock, pos in self.positions.items():
+            price = price_map.get(stock) or pos.open_price
+            market_value += price * pos.volume
+        return self.cash + market_value
+
+    # ---------- 费用 ----------
+
+    def buy_fee(self, amount: float) -> float:
+        return max(amount * self.cfg.commission_rate, self.cfg.min_commission)
+
+    def sell_fee(self, amount: float) -> float:
+        commission = max(amount * self.cfg.commission_rate, self.cfg.min_commission)
+        return commission + amount * self.cfg.stamp_tax_rate
+
+    def affordable_volume(self, price: float) -> int:
+        """按可用资金算出能买的最大整手数量（已预留佣金）"""
+        if price <= 0:
+            return 0
+        lot = self.cfg.lot_size
+        raw = self.cash / (price * (1 + self.cfg.commission_rate))
+        return int(raw / lot) * lot
+
+    # ---------- 交易 ----------
+
+    def buy(self, date: str, stock: str, price: float, volume: int, msg: str = '') -> bool:
+        if volume <= 0 or price <= 0:
+            return False
+
+        amount = price * volume
+        fee = self.buy_fee(amount)
+        if amount + fee > self.cash + 1e-6:
+            log.warning('资金不足，买入失败 %s 需要:%.2f 可用:%.2f', stock, amount + fee, self.cash)
+            return False
+
+        self.cash -= amount + fee
+        pos = self.positions.get(stock)
+        if pos is None:
+            pos = Position(stock, volume, price)
+            self.positions[stock] = pos
+        else:
+            pos.open_price = (pos.open_price * pos.volume + amount) / (pos.volume + volume)
+            pos.volume += volume
+        if not self.cfg.t_plus_one:
+            pos.can_use = pos.volume
+
+        self.deals.append(Deal(date, stock, BUY, price, volume, fee, msg))
+        log.info('买入成交 %s 价格:%.2f 数量:%d 费用:%.2f 余额:%.2f',
+                 stock, price, volume, fee, self.cash)
+        return True
+
+    def sell(self, date: str, stock: str, price: float, volume: int, msg: str = '') -> bool:
+        pos = self.positions.get(stock)
+        if pos is None or volume <= 0 or price <= 0:
+            return False
+
+        volume = min(volume, pos.can_use)
+        if volume <= 0:
+            log.info('%s 无可用数量，卖出跳过（T+1）', stock)
+            return False
+
+        amount = price * volume
+        fee = self.sell_fee(amount)
+        realized = (price - pos.open_price) * volume - fee
+
+        self.cash += amount - fee
+        pos.volume -= volume
+        pos.can_use -= volume
+        if pos.volume <= 0:
+            del self.positions[stock]
+
+        self.deals.append(Deal(date, stock, SELL, price, volume, fee, msg, realized))
+        log.info('卖出成交 %s 价格:%.2f 数量:%d 费用:%.2f 盈亏:%.2f 余额:%.2f',
+                 stock, price, volume, fee, realized, self.cash)
+        return True
+
+    def sell_all(self, date: str, stock: str, price: float, msg: str = '') -> bool:
+        pos = self.positions.get(stock)
+        if pos is None:
+            return False
+        return self.sell(date, stock, price, pos.can_use, msg)
+
+
+# ======================================================================
+# datasource.py
+# ======================================================================
+
+"""
+行情数据源。
+
+DataSource 定义策略需要的最小接口，策略层只依赖这个接口：
+  - XtDataSource  : 生产环境，走 xtquant.xtdata（需要本机 QMT / 投研端在线）
+  - CsvDataSource : 离线环境，从 csv 目录读数据，用于单元测试和无 QMT 时试跑
+
+约定：
+  - 日期一律用 'YYYYMMDD' 字符串
+  - get_bars 返回 {stock: DataFrame}，DataFrame 按日期升序，index 为日期字符串
+  - 查询区间是「截至 end_date（含）的最后 count 根」
+"""
+
+
+
+
+# 单次 get_market_data_ex 的标的数量上限。一次性请求几千只容易超时或静默返回空表。
+PRELOAD_CHUNK_SIZE = 300
+
+# 所有 QMT 版本都支持的字段，作为 suspendFlag 不可用时的退路
+CORE_FIELDS = ('open', 'high', 'low', 'close', 'preClose', 'volume')
+
+NO_DATA_HINT = """
+[数据] xtdata 没有返回任何日线数据，请按以下顺序排查：
+  1. QMT / 投研端客户端是否已启动并登录（xtdata 只读本机客户端的数据缓存）
+  2. 本地是否下载过日线 —— 加 --download 重跑，或在客户端
+     「行情 -> 数据管理 / 数据下载」里补充日线数据
+  3. 运行 python run_backtest.py --check-data 逐步定位到底哪一步取不到数
+"""
+
+
+class DataSource(object):
+    """数据源接口"""
+
+    def get_sector_stocks(self, sector: str) -> List[str]:
+        raise NotImplementedError
+
+    def get_trading_dates(self, end_date: str) -> List[str]:
+        """返回截至 end_date 的全部交易日（升序）"""
+        raise NotImplementedError
+
+    def get_bars(self, stocks: Sequence[str], end_date: str, count: int,
+                 fields: Optional[Sequence[str]] = None) -> Dict[str, pd.DataFrame]:
+        raise NotImplementedError
+
+    def get_detail(self, stock: str) -> Optional[dict]:
+        raise NotImplementedError
+
+    def preload(self, stocks: Sequence[str], start_date: str, end_date: str) -> None:
+        """可选：批量预加载到内存"""
         return None
 
-    log_prices = np.log(close_prices)
-    X = np.arange(len(log_prices), dtype=float)
-
-    try:
-        slope, r2 = linear_regression(X, log_prices)
-    except Exception:
+    def download(self, stocks: Sequence[str], start_date: str, end_date: str) -> None:
+        """可选：补下载本地数据"""
         return None
 
-    if r2 <= 0:
+    # ---------- 基于 get_bars / get_detail 的通用便捷方法 ----------
+
+    def get_one(self, stock: str, end_date: str, count: int,
+                fields: Optional[Sequence[str]] = None) -> Optional[pd.DataFrame]:
+        df = self.get_bars([stock], end_date, count, fields).get(stock)
+        if df is None or len(df) == 0:
+            return None
+        return df
+
+    def has_data(self, stocks: Sequence[str], end_date: str, sample: int = 20) -> bool:
+        """抽样检查数据源在 end_date 之前是否有日线数据"""
+        probe = list(stocks)[:sample]
+        if not probe:
+            return False
+        data = self.get_bars(probe, end_date, 1)
+        return any(df is not None and len(df) > 0 for df in data.values())
+
+    def get_stock_name(self, stock: str) -> str:
+        detail = self.get_detail(stock)
+        if not detail:
+            return ''
+        return detail.get('InstrumentName', '') or ''
+
+    def get_market_cap(self, stock: str, last_close: float = 0.0) -> float:
+        """
+        总市值。优先取 TotalValue；缺失时用总股本 × 最新收盘价估算。
+        不同 QMT 版本总股本字段名不一致，依次尝试。
+        """
+        detail = self.get_detail(stock)
+        if not detail:
+            return 0.0
+
+        total_value = detail.get('TotalValue', 0) or 0
+        if total_value > 0:
+            return float(total_value)
+
+        for key in ('TotalVolume', 'TotalVolumn', 'TotalShares'):
+            shares = detail.get(key, 0) or 0
+            if shares > 0 and last_close > 0:
+                return float(shares) * float(last_close)
         return 0.0
 
-    annual_return = np.exp(slope * TRADING_DAYS_PER_YEAR) - 1
-    return float(annual_return * abs(r2))
+
+def _normalize(df: pd.DataFrame, end_date: str, count: int) -> pd.DataFrame:
+    """index 统一成日期字符串，按 end_date 截断并取最后 count 根"""
+    out = df.copy()
+    out.index = [str(i)[:8] for i in out.index]
+    out = out.loc[out.index <= end_date]
+    if count and count > 0:
+        out = out.tail(count)
+    return out
 
 
-# ============================================================
-# 步骤1：构建股票池
-# ============================================================
-
-def get_stock_pool(data, bar_date, base_pool):
+class XtDataSource(DataSource):
     """
-    用 bar_date（含）之前的数据过滤股票池，避免未来函数。
-    过滤：停牌、ST、市值区间
+    xtquant.xtdata 数据源。
+
+    use_cache=True 时 preload 会把整个回测区间的日线一次性读进内存，
+    之后按日期切片，避免逐个交易日对全市场重复调用 get_market_data_ex。
+    缓存未命中的标的会自动回落到实时查询。
     """
-    if not base_pool:
-        print('[get_stock_pool] 概念板块未获取到股票')
+
+    def __init__(self, use_cache: bool = True, market: str = 'SH'):
+        from xtquant import xtdata  # 延迟导入：没有 QMT 的机器也能 import 本模块
+
+        self._xtdata = xtdata
+        self.use_cache = use_cache
+        self.market = market
+        self.fields = tuple(DAILY_FIELDS)
+        self._cache: Dict[str, pd.DataFrame] = {}
+        self._detail_cache: Dict[str, Optional[dict]] = {}
+
+    # ---------- 板块 / 日历 ----------
+
+    def get_sector_stocks(self, sector: str) -> List[str]:
+        try:
+            return list(self._xtdata.get_stock_list_in_sector(sector) or [])
+        except Exception as e:
+            print(f'[数据] 板块 {sector} 获取失败: {e}')
+            return []
+
+    def get_trading_dates(self, end_date: str) -> List[str]:
+        timetags = self._xtdata.get_trading_dates(self.market, start_time='',
+                                                  end_time=end_date, count=-1)
+        days = [self._xtdata.timetag_to_datetime(t, '%Y%m%d') for t in timetags]
+        return [d for d in days if d <= end_date]
+
+    # ---------- 行情 ----------
+
+    def _raw_fetch(self, fields, stocks, start_date='', end_date='', count=-1):
+        """直接调用 get_market_data_ex，异常时返回空 dict"""
+        try:
+            data = self._xtdata.get_market_data_ex(
+                list(fields), list(stocks),
+                period='1d',
+                start_time=start_date,
+                end_time=end_date,
+                count=count,
+                dividend_type='none',
+                fill_data=True,
+            )
+        except Exception as e:
+            print(f'[数据] get_market_data_ex 调用失败: {e}')
+            return {}
+        return data or {}
+
+    @staticmethod
+    def _any_rows(data) -> bool:
+        return any(df is not None and len(df) > 0 for df in data.values())
+
+    def resolve_fields(self, sample_stocks, start_date='', end_date='') -> bool:
+        """
+        用少量标的探测可用字段。
+
+        某些 QMT 版本不支持 suspendFlag，整批请求会直接返回空表，
+        这里探测失败就退回核心字段，仍然为空则判定为本地无数据。
+        """
+        sample = list(sample_stocks)[:3]
+        if not sample:
+            return False
+
+        for fields in (self.fields, CORE_FIELDS):
+            if self._any_rows(self._raw_fetch(fields, sample, start_date, end_date)):
+                if tuple(fields) != tuple(self.fields):
+                    print(f'[数据] 字段 {sorted(set(self.fields) - set(fields))} 不可用，改用核心字段')
+                    self.fields = tuple(fields)
+                return True
+        return False
+
+    def preload(self, stocks, start_date, end_date, show_progress: bool = True):
+        if not self.use_cache or not stocks:
+            return
+
+        stocks = list(dict.fromkeys(stocks))
+        print(f'[数据] 预加载 {len(stocks)} 只标的 {start_date} ~ {end_date} ...')
+
+        if not self.resolve_fields(stocks, start_date, end_date):
+            print(NO_DATA_HINT)
+            return
+
+        loaded = 0
+        processed = 0
+        total_chunks = (len(stocks) + PRELOAD_CHUNK_SIZE - 1) // PRELOAD_CHUNK_SIZE
+        bar = Progress(len(stocks), prefix='[数据] 预加载',
+                       enabled=show_progress and total_chunks > 1)
+
+        for idx in range(total_chunks):
+            chunk = stocks[idx * PRELOAD_CHUNK_SIZE:(idx + 1) * PRELOAD_CHUNK_SIZE]
+            data = self._raw_fetch(self.fields, chunk, start_date, end_date)
+            for stock in chunk:
+                df = data.get(stock)
+                if df is None or len(df) == 0:
+                    continue
+                df = df.copy()
+                df.index = [str(i)[:8] for i in df.index]
+                self._cache[stock] = df
+                loaded += 1
+            processed += len(chunk)
+            bar.update(processed, suffix=f'已加载 {loaded} 只')
+        bar.close()
+
+        print(f'[数据] 预加载完成，{loaded} 只有数据')
+        if loaded == 0:
+            print(NO_DATA_HINT)
+
+    def get_bars(self, stocks, end_date, count, fields=None):
+        if isinstance(stocks, str):
+            stocks = [stocks]
+        fields = list(fields or self.fields)
+
+        result: Dict[str, pd.DataFrame] = {}
+        missing: List[str] = []
+
+        if self.use_cache:
+            for stock in stocks:
+                cached = self._cache.get(stock)
+                if cached is None:
+                    missing.append(stock)
+                    continue
+                sub = _normalize(cached, end_date, count)
+                if len(sub) > 0:
+                    result[stock] = sub
+            if not missing:
+                return result
+        else:
+            missing = list(stocks)
+
+        data = self._raw_fetch(fields, missing, end_date=end_date, count=count)
+
+        for stock in missing:
+            df = data.get(stock)
+            if df is None or len(df) == 0:
+                continue
+            result[stock] = _normalize(df, end_date, count)
+        return result
+
+    # ---------- 合约信息 ----------
+
+    def get_detail(self, stock):
+        if stock in self._detail_cache:
+            return self._detail_cache[stock]
+        try:
+            detail = self._xtdata.get_instrument_detail(stock)
+        except Exception:
+            detail = None
+        self._detail_cache[stock] = detail
+        return detail
+
+    def download(self, stocks, start_date, end_date, show_progress: bool = True):
+        """
+        补下载本地日线，带进度显示。
+
+        优先用 download_history_data2 + callback（xtdata 会实时回调下载进度）；
+        该接口或 callback 参数不可用时，退回逐只下载并自己统计进度。
+        """
+        stocks = list(dict.fromkeys(stocks))
+        if not stocks:
+            return
+
+        print(f'[数据] 开始下载日线: {len(stocks)} 只，{start_date} ~ {end_date}')
+        bar = Progress(len(stocks), prefix='[数据] 下载', enabled=show_progress)
+
+        def _callback(data):
+            """xtdata 回调，data 形如 {'finished': n, 'total': m, 'stockcode': '600000.SH'}"""
+            try:
+                total = int(data.get('total') or 0)
+                finished = int(data.get('finished') or 0)
+            except (AttributeError, TypeError, ValueError):
+                return
+            if total > 0:
+                bar.total = total
+            bar.update(finished, suffix=str(data.get('stockcode') or ''))
+
+        batch = getattr(self._xtdata, 'download_history_data2', None)
+        if batch is not None:
+            try:
+                batch(stocks, period='1d', start_time=start_date,
+                      end_time=end_date, callback=_callback)
+                bar.close()
+                print('[数据] 下载完成')
+                return
+            except TypeError:
+                # 该版本的 download_history_data2 不接受 callback
+                try:
+                    batch(stocks, period='1d', start_time=start_date, end_time=end_date)
+                    bar.update(len(stocks))
+                    bar.close()
+                    print('[数据] 下载完成（该版本不支持进度回调）')
+                    return
+                except Exception as e:
+                    print(f'[数据] 批量下载失败，改为逐只下载: {e}')
+            except Exception as e:
+                print(f'[数据] 批量下载失败，改为逐只下载: {e}')
+
+        failed = []
+        for i, stock in enumerate(stocks, 1):
+            try:
+                self._xtdata.download_history_data(stock, period='1d',
+                                                   start_time=start_date, end_time=end_date)
+            except Exception as e:
+                failed.append((stock, str(e)))
+            bar.update(i, suffix=stock)
+        bar.close()
+
+        if failed:
+            print(f'[数据] 下载完成，{len(failed)} 只失败，例如 {failed[:3]}')
+        else:
+            print('[数据] 下载完成')
+
+
+class CsvDataSource(DataSource):
+    """
+    离线 csv 数据源，目录结构：
+
+        data_dir/
+          bars/600000.SH.csv        # 列：date,open,high,low,close,preClose,volume,suspendFlag
+          instruments.json          # {"600000.SH": {"InstrumentName": "浦发银行", "TotalValue": 3.2e10}}
+          sectors.json              # {"沪深A股": ["600000.SH", ...]}
+
+    用于单元测试，以及没有 QMT 环境时用自备数据跑通流程。
+    """
+
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        self._cache: Dict[str, pd.DataFrame] = {}
+        self._details: Dict[str, dict] = {}
+        self._sectors: Dict[str, List[str]] = {}
+        self._load()
+
+    def _load(self):
+        bars_dir = os.path.join(self.data_dir, 'bars')
+        if os.path.isdir(bars_dir):
+            for name in sorted(os.listdir(bars_dir)):
+                if not name.endswith('.csv'):
+                    continue
+                stock = name[:-4]
+                df = pd.read_csv(os.path.join(bars_dir, name), dtype={'date': str})
+                df = df.set_index('date').sort_index()
+                df.index = [str(i)[:8] for i in df.index]
+                self._cache[stock] = df
+
+        detail_path = os.path.join(self.data_dir, 'instruments.json')
+        if os.path.isfile(detail_path):
+            with open(detail_path, encoding='utf-8') as f:
+                self._details = json.load(f)
+
+        sector_path = os.path.join(self.data_dir, 'sectors.json')
+        if os.path.isfile(sector_path):
+            with open(sector_path, encoding='utf-8') as f:
+                self._sectors = json.load(f)
+
+    # ---------- 接口实现 ----------
+
+    def get_sector_stocks(self, sector):
+        return list(self._sectors.get(sector, []))
+
+    def get_trading_dates(self, end_date):
+        days = set()
+        for df in self._cache.values():
+            days.update(df.index)
+        return sorted(d for d in days if d <= end_date)
+
+    def get_bars(self, stocks, end_date, count, fields=None):
+        if isinstance(stocks, str):
+            stocks = [stocks]
+        result = {}
+        for stock in stocks:
+            df = self._cache.get(stock)
+            if df is None:
+                continue
+            sub = _normalize(df, end_date, count)
+            if len(sub) > 0:
+                result[stock] = sub
+        return result
+
+    def get_detail(self, stock):
+        return self._details.get(stock)
+
+    # ---------- 供测试构造数据 ----------
+
+    @classmethod
+    def from_frames(cls, frames: Dict[str, pd.DataFrame],
+                    details: Optional[Dict[str, dict]] = None,
+                    sectors: Optional[Dict[str, Iterable[str]]] = None) -> 'CsvDataSource':
+        """直接用内存中的 DataFrame 构造数据源，不读磁盘"""
+        obj = cls.__new__(cls)
+        obj.data_dir = ''
+        obj._cache = {}
+        for stock, df in frames.items():
+            d = df.copy()
+            d.index = [str(i)[:8] for i in d.index]
+            obj._cache[stock] = d.sort_index()
+        obj._details = dict(details or {})
+        obj._sectors = {k: list(v) for k, v in (sectors or {}).items()}
+        return obj
+
+
+# ======================================================================
+# universe.py
+# ======================================================================
+
+"""步骤 1：股票池构建与过滤（停牌 / ST / 市值）。"""
+
+
+
+log = logging.getLogger(__name__)
+
+
+def build_base_pool(source: DataSource, cfg: StrategyConfig) -> List[str]:
+    """
+    从概念板块取原始股票池。板块成分不随日期变化，整个回测只需取一次。
+    """
+    pool = set()
+    for sector in cfg.concept_sectors:
+        stocks = source.get_sector_stocks(sector)
+        if not stocks:
+            log.warning('板块 %s 未取到成分股', sector)
+            continue
+        pool.update(stocks)
+
+    if not pool:
+        log.warning('概念板块未获取到股票')
         return []
 
-    quotes = data.get_bars(base_pool, bar_date, 2)
+    result = []
+    for stock in sorted(pool):
+        code = stock.split('.')[0]
+        if not code[:1].isdigit():          # 剔除指数 / 基金等非股票代码
+            continue
+        if cfg.exclude_gem and code.startswith(('300', '301')):
+            continue
+        if cfg.exclude_star and code.startswith('688'):
+            continue
+        result.append(stock)
+    return result
+
+
+def filter_universe(source: DataSource, base_pool: Sequence[str],
+                    date: str, cfg: StrategyConfig) -> List[str]:
+    """
+    用截至 date（含）的数据过滤股票池：
+      - 停牌（suspendFlag == 1）
+      - ST
+      - 市值不在 [min_market_cap, max_market_cap] 区间
+    取不到市值的标的不因此被剔除（与原脚本一致）。
+    """
+    if not base_pool:
+        return []
+
+    quotes = source.get_bars(base_pool, date, 2)
 
     result = []
     for stock in base_pool:
@@ -419,7 +1329,6 @@ def get_stock_pool(data, bar_date, base_pool):
         if df is None or len(df) < 1:
             continue
 
-        # 停牌过滤：suspendFlag == 1
         if 'suspendFlag' in df.columns:
             try:
                 if int(df['suspendFlag'].iloc[-1]) == 1:
@@ -431,26 +1340,17 @@ def get_stock_pool(data, bar_date, base_pool):
         if last_close <= 0:
             continue
 
-        # ST 过滤 + 市值过滤
-        detail = data.get_detail(stock)
+        detail = source.get_detail(stock)
         if not detail:
             continue
 
-        stock_name = detail.get('InstrumentName', '') or ''
-        if 'ST' in stock_name.upper():
-            continue
+        if cfg.exclude_st:
+            name = (detail.get('InstrumentName', '') or '').upper()
+            if 'ST' in name:
+                continue
 
-        total_value = detail.get('TotalValue', 0) or 0
-        if total_value <= 0:
-            # 不同版本字段名不一致，依次尝试总股本字段
-            total_shares = 0
-            for key in ('TotalVolume', 'TotalVolumn', 'TotalShares'):
-                total_shares = detail.get(key, 0) or 0
-                if total_shares > 0:
-                    break
-            if total_shares > 0:
-                total_value = total_shares * last_close
-        if total_value > 0 and (total_value < MIN_MARKET_CAP or total_value > MAX_MARKET_CAP):
+        market_cap = source.get_market_cap(stock, last_close)
+        if market_cap > 0 and not (cfg.min_market_cap <= market_cap <= cfg.max_market_cap):
             continue
 
         result.append(stock)
@@ -458,527 +1358,1420 @@ def get_stock_pool(data, bar_date, base_pool):
     return result
 
 
-def build_base_pool():
-    """从概念板块取原始股票池（只取一次，后续每日再做行情过滤）"""
-    pool_set = set()
-    for sector_name in CONCEPT_SECTORS:
-        try:
-            stocks = xtdata.get_stock_list_in_sector(sector_name)
-        except Exception as e:
-            print(f'[build_base_pool] 板块 {sector_name} 获取失败: {e}')
-            continue
-        if not stocks:
-            print(f'[build_base_pool] 板块 {sector_name} 为空')
-            continue
-        pool_set.update(stocks)
+# ======================================================================
+# selector.py
+# ======================================================================
 
-    # 代码前缀过滤（与原版一致，默认不剔除创业板/科创板）
-    pool_list = []
-    for stock in sorted(pool_set):
-        code = stock.split('.')[0]
-        # if code.startswith('300') or code.startswith('301'):
-        #     continue
-        # if code.startswith('688'):
-        #     continue
-        if not code[:1].isdigit():
-            continue
-        pool_list.append(stock)
-    return pool_list
+"""
+步骤 2~4：动量打分排序、动量分数序列、候选股过滤。
+
+所有取数一律多取 1 根并用 [-(n+1):-1] 切片排除当前 bar，
+保证打分只用到「上一交易日及之前」的收盘价，不含未来函数。
+"""
 
 
-# ============================================================
-# 步骤2：动量打分选股
-# ============================================================
 
-def get_rank(pool, data, bar_date):
-    """
-    动量打分：只用 bar_date 之前（不含当日）的收盘价，取第 1 名
-    """
+
+log = logging.getLogger(__name__)
+
+
+def rank_by_momentum(source: DataSource, pool: Sequence[str], date: str,
+                     cfg: StrategyConfig) -> List[Tuple[str, float]]:
+    """对股票池打分并按分数降序排列，返回 [(stock, score), ...]"""
     if not pool:
-        return None
+        return []
 
-    quotes = data.get_bars(pool, bar_date, LOOKBACK_DAYS + 2)
+    quotes = source.get_bars(pool, date, cfg.bars_needed_for_rank)
 
     scores = {}
     for stock in pool:
         df = quotes.get(stock)
-        if df is None or len(df) < LOOKBACK_DAYS + 1:
+        if df is None or len(df) < cfg.lookback_days + 1:
             continue
 
-        close_prices = df['close'].values
-        # 排除当前 bar（最后 1 根），使用其前 LOOKBACK_DAYS 根
-        hist = close_prices[-(LOOKBACK_DAYS + 1):-1]
-        if len(hist) < LOOKBACK_DAYS or np.any(np.isnan(hist)):
+        closes = df['close'].values
+        hist = closes[-(cfg.lookback_days + 1):-1]   # 排除当前 bar
+        if len(hist) < cfg.lookback_days or np.any(np.isnan(hist)):
             continue
 
-        score = calc_momentum_score(hist)
+        score = momentum_score(hist, cfg.trading_days_per_year)
         if score is not None:
             scores[stock] = score
 
-    if not scores:
+    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def pick_target(source: DataSource, pool: Sequence[str], date: str,
+                cfg: StrategyConfig) -> Optional[str]:
+    """取动量分数第 1 名"""
+    ranked = rank_by_momentum(source, pool, date, cfg)
+    if not ranked:
         return None
-
-    sorted_stocks = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    print(f'[get_rank] Top3: {[(s, round(float(sc), 4)) for s, sc in sorted_stocks[:3]]}')
-    return sorted_stocks[0][0]
+    log.info('Top3: %s', [(s, round(sc, 4)) for s, sc in ranked[:3]])
+    return ranked[0][0]
 
 
-# ============================================================
-# 步骤3：计算近 5 日动量分数序列
-# ============================================================
-
-def rank_stock_change(stock, data, bar_date):
+def momentum_series(source: DataSource, stock: str, date: str,
+                    cfg: StrategyConfig) -> List[float]:
     """
-    计算目标股票近 5 日（+ 最新 1 日）动量分数序列，全部排除当前 bar
+    目标股的动量分数序列，从远到近共 score_series_len + 1 个值
+    （原脚本取 5 个历史值再补 1 个最新值，共 6 个）。
+    数据不足时返回空列表。
     """
-    result = {}
+    df = source.get_one(stock, date, cfg.bars_needed_for_series)
+    if df is None or len(df) < cfg.lookback_days + 2:
+        return []
 
-    df = data.get_one(stock, bar_date, LOOKBACK_DAYS + 5 + 2)
-    if df is None or len(df) < LOOKBACK_DAYS + 2:
-        return result
+    closes = df['close'].values
+    n = cfg.lookback_days
+    scores: List[float] = []
 
-    close_prices = df['close'].values
-    scores = []
-
-    # 从远到近：d-5 ... d-1
-    for i in range(5, 0, -1):
-        window = close_prices[-(LOOKBACK_DAYS + 1 + i):-(i + 1)]
-        if len(window) >= LOOKBACK_DAYS and not np.any(np.isnan(window)):
-            score = calc_momentum_score(window)
+    for i in range(cfg.score_series_len, 0, -1):
+        window = closes[-(n + 1 + i):-(i + 1)]
+        if len(window) >= n and not np.any(np.isnan(window)):
+            score = momentum_score(window, cfg.trading_days_per_year)
             scores.append(score if score is not None else 0.0)
         else:
             scores.append(0.0)
 
-    # 最新一天（d0，仍排除当前 bar）
-    latest = close_prices[-(LOOKBACK_DAYS + 1):-1]
-    if len(latest) >= LOOKBACK_DAYS and not np.any(np.isnan(latest)):
-        score = calc_momentum_score(latest)
+    latest = closes[-(n + 1):-1]
+    if len(latest) >= n and not np.any(np.isnan(latest)):
+        score = momentum_score(latest, cfg.trading_days_per_year)
         scores.append(score if score is not None else 0.0)
     else:
         scores.append(0.0)
 
-    result[stock] = scores
-    return result
+    return scores
 
 
-# ============================================================
-# 步骤4：过滤候选股
-# ============================================================
-
-def filter_target(stock, data, bar_date):
-    """剔除停牌、跌停（跌停幅度按代码前缀区分 10% / 20%）"""
-    if stock is None:
+def filter_target(source: DataSource, stock: Optional[str], date: str,
+                  cfg: StrategyConfig) -> Optional[str]:
+    """剔除停牌、跌停的候选股；通过则原样返回代码"""
+    if not stock:
         return None
 
-    df = data.get_one(stock, bar_date, 1)
+    df = source.get_one(stock, date, 1)
     if df is None:
         return None
 
     if 'suspendFlag' in df.columns:
         try:
             if int(df['suspendFlag'].iloc[-1]) == 1:
-                print(f'[filter_target] {stock} 停牌中')
+                log.info('%s 停牌中', stock)
                 return None
         except (TypeError, ValueError):
             pass
 
     last_close = float(df['close'].iloc[-1])
-    pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else last_close
     if last_close <= 0:
         return None
 
-    limit_down = round(pre_close * (1 - get_limit_ratio(stock)), 2)
+    pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else last_close
+    ratio = limit_ratio(stock) if cfg.dynamic_limit_down else 0.10
+    limit_down = round(pre_close * (1 - ratio), 2)
     if last_close <= limit_down:
-        print(f'[filter_target] {stock} 跌停 收盘:{last_close} 跌停价:{limit_down}')
+        log.info('%s 跌停，收盘:%.2f 跌停价:%.2f', stock, last_close, limit_down)
         return None
 
     return stock
 
 
-# ============================================================
-# 步骤5：综合择时信号
-# ============================================================
-
-def get_timing_signal(stock, data, bar_date, stock_df):
+def price_and_limits(source: DataSource, stock: str, date: str):
     """
-    RSRS 仅记录，不介入决策
-    实际信号 = 动量分数是否连续下降 >= 2 天
+    返回 (开盘价, 涨停价, 跌停价, 最低价)，取不到时四个值均为 0.0。
+    涨跌停幅度按代码前缀区分。
     """
-    rsrs = calc_rsrs(data, bar_date)
-    if rsrs is not None:
-        print(f'[择时] RSRS修正标准分: {rsrs:.4f}')
-    else:
-        print('[择时] RSRS 数据不足')
+    df = source.get_one(stock, date, 1)
+    if df is None:
+        return 0.0, 0.0, 0.0, 0.0
 
-    scores = stock_df.get(stock, [])
-    if len(scores) < 1:
-        return 'KEEP'
+    open_price = float(df['open'].iloc[-1])
+    low_price = float(df['low'].iloc[-1]) if 'low' in df.columns else open_price
+    pre_close = float(df['preClose'].iloc[-1]) if 'preClose' in df.columns else open_price
+    if pre_close <= 0:
+        return open_price, 0.0, 0.0, low_price
 
-    sig = 0
+    ratio = limit_ratio(stock)
+    return (open_price,
+            round(pre_close * (1 + ratio), 2),
+            round(pre_close * (1 - ratio), 2),
+            low_price)
+
+
+# ======================================================================
+# timing.py
+# ======================================================================
+
+"""
+步骤 5：择时信号。
+
+与原脚本一致：RSRS 只计算并打印，不参与决策；
+实际信号由目标股动量分数「连续下降天数」决定。
+"""
+
+
+
+log = logging.getLogger(__name__)
+
+SIGNAL_BUY = 'BUY'
+SIGNAL_SELL = 'SELL'
+SIGNAL_KEEP = 'KEEP'
+
+
+def count_decline_days(scores: Sequence[float], epsilon: float = 0.0) -> int:
+    """
+    从最新一个分数往前数，连续下降了多少天。
+
+    epsilon 为相对容差：只有 scores[i] 比 scores[i-1] 低出 epsilon * |scores[i-1]|
+    才算一次下降。默认 0.0，即原脚本的严格比较。
+    """
+    days = 0
     for i in range(len(scores) - 1, 0, -1):
-        if scores[i] < scores[i - 1]:
-            sig += 1
+        threshold = scores[i - 1] - abs(scores[i - 1]) * epsilon
+        if scores[i] < threshold:
+            days += 1
         else:
             break
-
-    print(f'[择时] 动量分数序列: {[round(float(s), 4) for s in scores]}')
-    print(f'[择时] 连续下降天数: {sig}')
-
-    return 'SELL' if sig >= 2 else 'BUY'
+    return days
 
 
-def calc_rsrs(data, bar_date):
-    """RSRS：N=21 根高低点回归取斜率，M=600 根算 zscore，再乘 R2"""
-    df = data.get_one(RSRS_INDEX, bar_date, RSRS_M + RSRS_N + 2)
-    if df is None or len(df) < RSRS_M + RSRS_N + 1:
+def timing_signal(scores: Sequence[float], cfg: StrategyConfig) -> str:
+    """
+    分数序列为空 -> KEEP（维持现状）
+    连续下降天数 >= decline_days_to_sell -> SELL，否则 BUY
+    """
+    if not scores:
+        return SIGNAL_KEEP
+
+    days = count_decline_days(scores, cfg.decline_epsilon)
+    log.info('动量分数序列: %s', [round(float(s), 4) for s in scores])
+    log.info('连续下降天数: %d', days)
+
+    return SIGNAL_SELL if days >= cfg.decline_days_to_sell else SIGNAL_BUY
+
+
+def rsrs_value(source: DataSource, date: str, cfg: StrategyConfig) -> Optional[float]:
+    """大盘 RSRS 修正标准分（排除当前 bar）"""
+    if not cfg.rsrs_enabled:
         return None
 
-    # 排除当前 bar
-    highs = df['high'].values[:-1]
-    lows = df['low'].values[:-1]
-
-    betas = []
-    r2_list = []
-    for i in range(RSRS_N - 1, len(highs)):
-        h = highs[i - RSRS_N + 1:i + 1]
-        l = lows[i - RSRS_N + 1:i + 1]
-        if len(h) < RSRS_N or np.any(np.isnan(h)) or np.any(np.isnan(l)):
-            continue
-        try:
-            slope, r2 = linear_regression(l, h)
-        except Exception:
-            continue
-        betas.append(slope)
-        r2_list.append(r2)
-
-    if len(betas) < RSRS_M:
+    df = source.get_one(cfg.rsrs_index, date, cfg.bars_needed_for_rsrs)
+    if df is None or len(df) < cfg.rsrs_m + cfg.rsrs_n + 1:
         return None
 
-    recent_betas = betas[-RSRS_M:]
-    mean_beta = np.mean(recent_betas)
-    std_beta = np.std(recent_betas)
-    if std_beta == 0:
-        return 0.0
-
-    zscore = (recent_betas[-1] - mean_beta) / std_beta
-    recent_r2 = r2_list[-1] if r2_list else 0
-    return zscore * recent_r2
+    return rsrs_score(df['high'].values[:-1], df['low'].values[:-1],
+                      n=cfg.rsrs_n, m=cfg.rsrs_m)
 
 
-# ============================================================
-# 步骤6：执行调仓
-# ============================================================
+# ======================================================================
+# engine.py
+# ======================================================================
 
-def adjust_position(stock, signal, data, bar_date, account):
-    """
-    SELL     -> 清仓
-    BUY/KEEP -> 持仓已是目标股则持有，否则先卖旧再买新
-    成交价统一取当日开盘价（对应原版 passorder 指定价单）
-    """
-    current_holdings = account.get_holdings_can_use()
-    print(f'[调仓] 当前持仓(可用): {current_holdings}')
+"""
+回测引擎：把原脚本 handlebar 里的单日流程搬过来，改为按交易日列表循环驱动。
 
-    if signal == 'SELL':
-        for s, vol in list(current_holdings.items()):
-            px_df = data.get_one(s, bar_date, 1)
-            if px_df is None:
-                print(f'[调仓] 无法获取 {s} 价格，卖出跳过')
+单个交易日的顺序（与原脚本一致）：
+  ① 股票池 -> 动量打分取第 1 名 -> 分数序列 -> 跌停停牌过滤 -> 择时 -> 调仓（开盘价成交）
+  ② 止损检查（收盘价，触发 -15% 则清仓）
+  ③ 复盘打印并记录当日总资产
+"""
+
+
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class DailyRecord:
+    """每个交易日收盘后的快照，用于保存回测结果"""
+
+    date: str
+    target: str = ''          # 当日选出的目标股
+    signal: str = ''          # 择时信号
+    stock: str = ''           # 收盘持仓
+    volume: int = 0
+    cost: float = 0.0
+    price: float = 0.0
+    market_value: float = 0.0
+    cash: float = 0.0
+    total_asset: float = 0.0
+
+
+@dataclass
+class BacktestResult:
+    account: SimAccount
+    equity_curve: List[Tuple[str, float]] = field(default_factory=list)
+    signals: List[Tuple[str, str, Optional[str]]] = field(default_factory=list)  # (日期, 信号, 目标股)
+    daily: List[DailyRecord] = field(default_factory=list)
+
+    @property
+    def dates(self) -> List[str]:
+        return [d for d, _ in self.equity_curve]
+
+    @property
+    def values(self) -> List[float]:
+        return [v for _, v in self.equity_curve]
+
+
+class BacktestEngine:
+    def __init__(self, source: DataSource, config: BacktestConfig,
+                 account: Optional[SimAccount] = None):
+        self.source = source
+        self.config = config
+        self.cfg = config.strategy
+        self.account = account or SimAccount(config.account)
+        self.base_pool: List[str] = []
+        self.score_series: Dict[str, List[float]] = {}
+        self.today_target: Optional[str] = None
+
+    # ---------- 交易日历 ----------
+
+    def trading_days(self) -> Tuple[List[str], str]:
+        """返回 (回测交易日列表, 含预热的数据起点日期)"""
+        all_days = self.source.get_trading_dates(self.config.end_date)
+        if not all_days:
+            raise RuntimeError('未取到交易日历，请检查数据源（QMT 是否已启动并下载过数据）')
+
+        run_days = [d for d in all_days if d >= self.config.start_date]
+        if not run_days:
+            raise RuntimeError(f'区间 {self.config.start_date} ~ {self.config.end_date} 内没有交易日')
+
+        first = all_days.index(run_days[0])
+        warm_idx = max(0, first - self.cfg.warmup_days)
+        return run_days, all_days[warm_idx]
+
+    def _warm_start(self, extra_days: int) -> str:
+        all_days = self.source.get_trading_dates(self.config.end_date)
+        run_days = [d for d in all_days if d >= self.config.start_date]
+        if not run_days:
+            return self.config.start_date
+        first = all_days.index(run_days[0])
+        return all_days[max(0, first - extra_days)]
+
+    # ---------- 主流程 ----------
+
+    def prepare(self, download: bool = False) -> List[str]:
+        self.base_pool = build_base_pool(self.source, self.cfg)
+        log.info('原始股票池: %d 只', len(self.base_pool))
+        if not self.base_pool:
+            return []
+
+        stock_start = self._warm_start(self.cfg.warmup_days + 5)
+        index_start = self._warm_start(self.cfg.bars_needed_for_rsrs + 10)
+
+        if download:
+            self.source.download(list(self.base_pool) + [self.cfg.rsrs_index],
+                                 index_start, self.config.end_date)
+
+        self.source.preload(self.base_pool, stock_start, self.config.end_date)
+        if self.cfg.rsrs_enabled:
+            self.source.preload([self.cfg.rsrs_index], index_start, self.config.end_date)
+
+        if not self.source.has_data(self.base_pool, self.config.end_date):
+            raise RuntimeError(
+                '数据源取不到任何日线数据，回测无法开始。\n'
+                '  - 加 --download 让脚本补下载，或在 QMT 客户端「行情 -> 数据管理」补充日线\n'
+                '  - 用 python run_backtest.py --check-data 逐步定位'
+            )
+        return self.base_pool
+
+    def run(self, download: bool = False, show_progress: bool = False) -> BacktestResult:
+        log.info('回测区间: %s ~ %s，初始资金: %.0f',
+                 self.config.start_date, self.config.end_date, self.account.init_cash)
+        log.info('板块数: %d，动量回看: %d 天，止损线: %.0f%%',
+                 len(self.cfg.concept_sectors), self.cfg.lookback_days,
+                 self.cfg.stop_loss_ratio * 100)
+
+        run_days, _ = self.trading_days()
+        log.info('交易日: %d 个', len(run_days))
+
+        if not self.prepare(download=download):
+            raise RuntimeError('股票池为空，请检查板块名称或数据源')
+
+        result = BacktestResult(account=self.account)
+        bar = Progress(len(run_days), prefix='[回测] 交易日', enabled=show_progress)
+        for n, date in enumerate(run_days, 1):
+            total = self.run_day(date)
+            result.equity_curve.append((date, total))
+            result.signals.append((date, self._last_signal, self.today_target))
+            result.daily.append(self.daily_record(date, total))
+            bar.update(n, suffix=date)
+        bar.close()
+        return result
+
+    def daily_record(self, date: str, total: float) -> DailyRecord:
+        """收盘快照。策略最多持有 1 只，取第一只持仓即可"""
+        record = DailyRecord(date=date, target=self.today_target or '',
+                             signal=self._last_signal, cash=self.account.cash,
+                             total_asset=total)
+        for pos in self.account.get_positions():
+            price = self._last_price_map.get(pos.stock, pos.open_price)
+            record.stock = pos.stock
+            record.volume = pos.volume
+            record.cost = pos.open_price
+            record.price = price
+            record.market_value = price * pos.volume
+            break
+        return record
+
+    # ---------- 单个交易日 ----------
+
+    _last_signal = ''
+    _last_price_map: Dict[str, float] = {}
+
+    def run_day(self, date: str) -> float:
+        log.info('=' * 56)
+        log.info('交易日: %s', date)
+
+        self.account.settle_open()
+        self._last_signal = ''
+        self.today_target = None
+
+        pool = filter_universe(self.source, self.base_pool, date, self.cfg)
+        if not pool:
+            log.info('股票池为空，跳过今日')
+            return self.review(date)
+        log.info('步骤1 - 股票池: %d 只', len(pool))
+
+        target = pick_target(self.source, pool, date, self.cfg)
+        if target is None:
+            log.info('步骤2 - 未选出目标股票')
+            return self.review(date)
+        log.info('步骤2 - 目标: %s %s', target, self.source.get_stock_name(target))
+
+        scores = momentum_series(self.source, target, date, self.cfg)
+        self.score_series = {target: scores}
+        log.info('步骤3 - 动量分数序列: %s', [round(float(s), 4) for s in scores])
+
+        target = filter_target(self.source, target, date, self.cfg)
+        if target is None:
+            log.info('步骤4 - 目标股票被过滤')
+            return self.review(date)
+        self.today_target = target
+        log.info('步骤4 - 过滤通过: %s', target)
+
+        rsrs = rsrs_value(self.source, date, self.cfg)
+        log.info('RSRS修正标准分: %s', f'{rsrs:.4f}' if rsrs is not None else '数据不足')
+
+        signal = timing_signal(scores, self.cfg)
+        self._last_signal = signal
+        log.info('步骤5 - 择时信号: %s', signal)
+
+        self.adjust_position(date, target, signal)
+        log.info('步骤6 - 调仓执行完毕')
+
+        self.check_stop_loss(date)
+        return self.review(date)
+
+    # ---------- 步骤 6：调仓 ----------
+
+    def adjust_position(self, date: str, target: str, signal: str) -> None:
+        holdings = self.account.holdings_can_use()
+        log.info('当前可用持仓: %s', holdings)
+
+        if signal == SIGNAL_SELL:
+            for stock in list(holdings):
+                self._sell_at_open(date, stock, f'SELL信号 清仓 {stock}')
+            return
+
+        # BUY / KEEP：已持有目标股则继续持有
+        if holdings.get(target, 0) > 0:
+            log.info('KEEP: 继续持有 %s', target)
+            return
+
+        # 换仓：先卖掉非目标持仓
+        for stock in list(holdings):
+            if stock == target:
                 continue
-            price = float(px_df['open'].iloc[-1])
-            msg = f'SELL信号 清仓 {s}'
-            print(f'[调仓] {msg}')
-            account.sell(bar_date, s, price, vol, msg)
-        return
+            self._sell_at_open(date, stock, f'切换标的 卖出 {stock}')
 
-    # BUY / KEEP：已持有目标股则继续持有
-    if stock in current_holdings and current_holdings[stock] > 0:
-        print(f'[调仓] KEEP: 继续持有 {stock}')
-        return
+        open_price, limit_up, limit_down, low_price = price_and_limits(self.source, target, date)
+        log.info('%s 开盘:%.2f 涨停:%.2f 跌停:%.2f 最低:%.2f',
+                 target, open_price, limit_up, limit_down, low_price)
 
-    # 换仓：先卖旧
-    for s, vol in list(current_holdings.items()):
-        if s == stock:
-            continue
-        px_df = data.get_one(s, bar_date, 1)
-        if px_df is None:
-            print(f'[调仓] 无法获取 {s} 价格，卖出跳过')
-            continue
-        price = float(px_df['open'].iloc[-1])
-        msg = f'切换标的 卖出 {s}'
-        print(f'[调仓] {msg}')
-        account.sell(bar_date, s, price, vol, msg)
+        if open_price <= 0:
+            log.warning('%s 价格异常: %s', target, open_price)
+            return
 
-    # 再买新
-    current_price, limit_up, limit_down, low_price = get_price_and_limits(stock, data, bar_date)
-    print(f'[调仓] {stock} 开盘:{current_price:.2f} 涨停:{limit_up:.2f} 跌停:{limit_down:.2f} 最低:{low_price:.2f}')
+        if limit_up > 0 and low_price >= limit_up:
+            log.info('开盘一字涨停，无法买入')
+            return
 
-    if current_price <= 0:
-        print(f'[调仓] {stock} 价格异常: {current_price}')
-        return
+        volume = self.account.affordable_volume(open_price)
+        if volume < self.account.cfg.lot_size:
+            log.info('资金不足买 1 手，可用:%.2f 股价:%.2f', self.account.cash, open_price)
+            return
 
-    if limit_up > 0 and low_price >= limit_up:
-        print('[调仓] 开盘一字涨停，无法买入')
-        return
+        self.account.buy(date, target, open_price, volume,
+                         f'BUY信号 买入 {target} {volume}股')
 
-    available_cash = account.cash
-    # 预留手续费，避免因佣金导致资金不足
-    buy_vol = int(available_cash / (current_price * (1 + COMMISSION_RATE)) / 100) * 100
-    if buy_vol < 100:
-        print(f'[调仓] 资金不足买 1 手，可用:{available_cash:.2f} 股价:{current_price}')
-        return
-
-    msg = f'BUY信号 买入 {stock} {buy_vol}股'
-    print(f'[调仓] {msg}')
-    account.buy(bar_date, stock, current_price, buy_vol, msg)
-
-
-# ============================================================
-# 止损检查（原 14:50 check_lose，回测用当日收盘价）
-# ============================================================
-
-def check_lose(data, bar_date, account):
-    for pos in account.get_positions():
-        stock = pos.stock
-        cost_price = pos.open_price
-        volume = pos.can_use
-        if volume <= 0 or cost_price <= 0:
-            continue
-
-        df = data.get_one(stock, bar_date, 1)
+    def _sell_at_open(self, date: str, stock: str, msg: str) -> None:
+        df = self.source.get_one(stock, date, 1)
         if df is None:
-            continue
-        current_price = float(df['close'].iloc[-1])
-        if current_price <= 0:
-            continue
+            log.warning('无法获取 %s 价格，卖出跳过', stock)
+            return
+        self.account.sell_all(date, stock, float(df['open'].iloc[-1]), msg)
 
-        profit_ratio = (current_price - cost_price) / cost_price
-        print(f'[止损检查] {stock} {data.get_stock_name(stock)} '
-              f'成本:{cost_price:.2f} 收盘:{current_price:.2f} 盈亏:{profit_ratio:.2%}')
+    # ---------- 止损 ----------
 
-        if profit_ratio <= STOP_LOSS_RATIO:
-            print(f'[止损检查] {stock} 触发硬止损！盈亏 {profit_ratio:.2%} <= {STOP_LOSS_RATIO:.0%}，强制清仓')
-            account.sell(bar_date, stock, current_price, volume, f'硬止损平仓 {stock}')
+    def check_stop_loss(self, date: str) -> None:
+        """用当日收盘价判断是否触发硬止损（原脚本 14:50 的盘中检查）"""
+        for pos in self.account.get_positions():
+            if pos.can_use <= 0 or pos.open_price <= 0:
+                continue
 
+            df = self.source.get_one(pos.stock, date, 1)
+            if df is None:
+                continue
+            close = float(df['close'].iloc[-1])
+            if close <= 0:
+                continue
 
-# ============================================================
-# 复盘打印（原 15:05 print_trade_info）
-# ============================================================
+            profit = (close - pos.open_price) / pos.open_price
+            log.info('止损检查 %s %s 成本:%.2f 收盘:%.2f 盈亏:%.2f%%',
+                     pos.stock, self.source.get_stock_name(pos.stock),
+                     pos.open_price, close, profit * 100)
 
-def print_trade_info(data, bar_date, account):
-    today_deals = [d for d in account.deals if d.date == bar_date]
-    if today_deals:
-        print(f'--- 今日成交 ({len(today_deals)} 笔) ---')
-        for deal in today_deals:
-            print(f'  {deal.stock} {"买入" if deal.direction == 1 else "卖出"} '
-                  f'价格:{deal.price:.2f} 数量:{deal.volume}')
+            if profit <= self.cfg.stop_loss_ratio:
+                log.info('%s 触发硬止损（%.2f%% <= %.0f%%），强制清仓',
+                         pos.stock, profit * 100, self.cfg.stop_loss_ratio * 100)
+                self.account.sell_all(date, pos.stock, close, f'硬止损平仓 {pos.stock}')
 
-    price_map = {}
-    for pos in account.get_positions():
-        df = data.get_one(pos.stock, bar_date, 1)
-        current_price = float(df['close'].iloc[-1]) if df is not None else 0.0
-        price_map[pos.stock] = current_price
-        market_value = current_price * pos.volume
-        profit_ratio = (current_price - pos.open_price) / pos.open_price if pos.open_price > 0 else 0
-        print(f'  持仓: {pos.stock} {data.get_stock_name(pos.stock)} '
-              f'成本:{pos.open_price:.2f} 收盘:{current_price:.2f} '
-              f'盈亏:{profit_ratio:.2%} 市值:{market_value:.0f}')
+    # ---------- 复盘 ----------
 
-    total = account.total_asset(price_map)
-    print(f'  资金: 可用={account.cash:.0f} 总资产={total:.0f}')
-    return total
+    def review(self, date: str) -> float:
+        today_deals = [d for d in self.account.deals if d.date == date]
+        if today_deals:
+            log.info('今日成交 %d 笔:', len(today_deals))
+            for deal in today_deals:
+                log.info('  %s %s 价格:%.2f 数量:%d',
+                         deal.stock, '买入' if deal.direction > 0 else '卖出',
+                         deal.price, deal.volume)
 
+        price_map: Dict[str, float] = {}
+        for pos in self.account.get_positions():
+            df = self.source.get_one(pos.stock, date, 1)
+            close = float(df['close'].iloc[-1]) if df is not None else 0.0
+            price_map[pos.stock] = close
+            profit = (close - pos.open_price) / pos.open_price if pos.open_price > 0 else 0.0
+            log.info('  持仓 %s %s 成本:%.2f 收盘:%.2f 盈亏:%.2f%% 市值:%.0f',
+                     pos.stock, self.source.get_stock_name(pos.stock),
+                     pos.open_price, close, profit * 100, close * pos.volume)
 
-# ============================================================
-# 单个交易日流程（对应原版 handlebar）
-# ============================================================
-
-def run_one_day(data, bar_date, account, base_pool, state):
-    print('\n' + '=' * 60)
-    print(f'[回测] 交易日: {bar_date}')
-    print('=' * 60)
-
-    account.settle_open()   # T+1 解冻
-
-    # 步骤1：构建股票池
-    pool = get_stock_pool(data, bar_date, base_pool)
-    if not pool:
-        print('[回测] 股票池为空，跳过今日')
-        return print_trade_info(data, bar_date, account)
-    print(f'[回测] 步骤1 - 股票池: {len(pool)} 只')
-
-    # 步骤2：动量打分选股，取第 1 名
-    target_stock = get_rank(pool, data, bar_date)
-    if target_stock is None:
-        print('[回测] 步骤2 - 未选出目标股票')
-        return print_trade_info(data, bar_date, account)
-    print(f'[回测] 步骤2 - 目标: {target_stock} {data.get_stock_name(target_stock)}')
-
-    # 步骤3：近 5 日动量分数序列
-    state['stock_df'] = rank_stock_change(target_stock, data, bar_date)
-    scores = state['stock_df'].get(target_stock, [])
-    print(f'[回测] 步骤3 - 近5日动量分数: {[round(float(s), 4) for s in scores]}')
-
-    # 步骤4：过滤候选股
-    target_stock = filter_target(target_stock, data, bar_date)
-    if target_stock is None:
-        print('[回测] 步骤4 - 目标股票被过滤')
-        return print_trade_info(data, bar_date, account)
-    state['today_target'] = target_stock
-    print(f'[回测] 步骤4 - 过滤通过: {target_stock}')
-
-    # 步骤5：择时信号
-    signal = get_timing_signal(target_stock, data, bar_date, state['stock_df'])
-    print(f'[回测] 步骤5 - 择时信号: {signal}')
-
-    # 步骤6：调仓
-    adjust_position(target_stock, signal, data, bar_date, account)
-    print('[回测] 步骤6 - 调仓执行完毕')
-
-    # 止损检查（收盘价）
-    check_lose(data, bar_date, account)
-
-    # 复盘
-    return print_trade_info(data, bar_date, account)
+        self._last_price_map = price_map
+        total = self.account.total_asset(price_map)
+        log.info('  资金 可用:%.0f 总资产:%.0f', self.account.cash, total)
+        return total
 
 
-# ============================================================
-# 回测主流程
-# ============================================================
+# ======================================================================
+# vector_engine.py
+# ======================================================================
 
-def get_trading_days(start_date, end_date, extra_before=0):
+"""
+向量化回测引擎。
+
+和逐日版（BacktestEngine）相比，选股环节全部换成矩阵运算：
+  - 股票池过滤：停牌 / 收盘价 / ST / 市值 一次性算成 (交易日 × 标的) 的布尔矩阵
+  - 动量打分：整块滚动回归，125 万次 polyfit -> 几次矩阵运算
+  - 动量分数序列：直接切分数矩阵的一列
+  - RSRS：整段历史滚动一次，不再每天重算 600 次回归
+
+下单、止损、复盘完全继承逐日版，保证两个引擎的交易逻辑只有一份实现。
+
+与逐日版的一处行为差异：面板按交易日历对齐，某只标的当日没有数据即视为
+当日不可交易；逐日版会沿用它最近一根 K 线（已退市标的会一直参与打分）。
+行情完整时两者结果一致。
+"""
+
+
+
+
+log = logging.getLogger(__name__)
+
+
+class PanelDataSource(DataSource):
     """
-    返回 (回测交易日列表, 含预热的起始日期)
-    extra_before：在 start_date 之前额外向前取多少个交易日作为预热
+    把面板包装成 DataSource，供继承来的下单 / 止损 / 复盘代码取价。
+    面板里没有的标的（例如指数）回落到底层数据源。
     """
-    timetags = xtdata.get_trading_dates('SH', start_time='', end_time=end_date, count=-1)
-    all_days = [xtdata.timetag_to_datetime(t, '%Y%m%d') for t in timetags]
-    all_days = [d for d in all_days if d <= end_date]
-    if not all_days:
-        raise RuntimeError('未取到交易日历，请检查 QMT 客户端是否已启动并下载过数据')
 
-    run_days = [d for d in all_days if d >= start_date]
-    if not run_days:
-        raise RuntimeError(f'区间 {start_date} ~ {end_date} 内没有交易日')
+    def __init__(self, panel: Panel, base: DataSource):
+        self.panel = panel
+        self.base = base
+        close = panel.field('close')
+        # 每只标的的有效行号，取价时用 searchsorted 定位，避免逐次扫描
+        self._valid_rows = [np.flatnonzero(np.isfinite(close[:, j]))
+                            for j in range(close.shape[1])] if close is not None else []
 
-    first_idx = all_days.index(run_days[0])
-    warm_idx = max(0, first_idx - extra_before)
-    return run_days, all_days[warm_idx]
+    # --- 透传 ---
+    def get_sector_stocks(self, sector):
+        return self.base.get_sector_stocks(sector)
+
+    def get_trading_dates(self, end_date):
+        return self.base.get_trading_dates(end_date)
+
+    def get_detail(self, stock):
+        return self.base.get_detail(stock)
+
+    def preload(self, stocks, start_date, end_date):
+        return None
+
+    def download(self, stocks, start_date, end_date):
+        return self.base.download(stocks, start_date, end_date)
+
+    # --- 取价 ---
+    def get_bars(self, stocks, end_date, count, fields=None):
+        import pandas as pd
+
+        if isinstance(stocks, str):
+            stocks = [stocks]
+
+        panel = self.panel
+        i = panel.index_of(end_date)
+        result = {}
+        outside = []
+
+        for stock in stocks:
+            j = panel.stock_pos.get(stock)
+            if j is None:
+                outside.append(stock)
+                continue
+            if i < 0:
+                continue
+
+            rows = self._valid_rows[j]
+            end = int(np.searchsorted(rows, i, side='right'))
+            if end <= 0:
+                continue
+            start = 0 if count is None or count <= 0 else max(0, end - count)
+            take = rows[start:end]
+            if len(take) == 0:
+                continue
+
+            use = list(fields) if fields else list(panel.arrays)
+            data = {f: panel.arrays[f][take, j] for f in use if panel.has(f)}
+            result[stock] = pd.DataFrame(data, index=[panel.dates[r] for r in take])
+
+        if outside:
+            result.update(self.base.get_bars(outside, end_date, count, fields))
+        return result
 
 
-def download_data(stocks, start_date, end_date):
-    print(f'[下载] 开始补下载日线数据: {len(stocks)} 只 ...')
-    try:
-        xtdata.download_history_data2(stocks, period='1d',
-                                      start_time=start_date, end_time=end_date)
-    except AttributeError:
-        for i, stock in enumerate(stocks, 1):
-            xtdata.download_history_data(stock, period='1d',
-                                         start_time=start_date, end_time=end_date)
-            if i % 200 == 0:
-                print(f'[下载] {i}/{len(stocks)}')
-    print('[下载] 完成')
+class VectorBacktestEngine(BacktestEngine):
+    def __init__(self, source: DataSource, config: BacktestConfig, account=None):
+        super().__init__(source, config, account)
+        self.panel: Optional[Panel] = None
+        self.scores: Optional[np.ndarray] = None
+        self.pool_mask: Optional[np.ndarray] = None
+        self.tradable: Optional[np.ndarray] = None
+        self.rsrs: Optional[np.ndarray] = None
+        self._base_source = source
+
+    # ---------- 预处理 ----------
+
+    def prepare(self, download: bool = False) -> List[str]:
+        self.base_pool = build_base_pool(self._base_source, self.cfg)
+        log.info('原始股票池: %d 只', len(self.base_pool))
+        if not self.base_pool:
+            return []
+
+        stock_start = self._warm_start(self.cfg.warmup_days + 5)
+        index_start = self._warm_start(self.cfg.bars_needed_for_rsrs + 10)
+
+        if download:
+            self._base_source.download(list(self.base_pool) + [self.cfg.rsrs_index],
+                                       index_start, self.config.end_date)
+
+        self._base_source.preload(self.base_pool, stock_start, self.config.end_date)
+        if self.cfg.rsrs_enabled:
+            self._base_source.preload([self.cfg.rsrs_index], index_start, self.config.end_date)
+
+        log.info('构建行情面板 ...')
+        self.panel = Panel.from_source(self._base_source, self.base_pool,
+                                       stock_start, self.config.end_date)
+        if not len(self.panel) or not self.panel.stocks:
+            raise RuntimeError(
+                '数据源取不到任何日线数据，回测无法开始。\n'
+                '  - 加 --download 让脚本补下载，或在 QMT 客户端「行情 -> 数据管理」补充日线\n'
+                '  - 用 python run_backtest.py --check-data 逐步定位'
+            )
+        log.info('面板规模: %d 个交易日 × %d 只标的', *self.panel.shape)
+
+        self.source = PanelDataSource(self.panel, self._base_source)
+        self._build_matrices(index_start)
+        return self.base_pool
+
+    def _build_matrices(self, index_start: str) -> None:
+        panel = self.panel
+        close = panel.field('close')
+        n, m = panel.shape
+
+        # --- 动量分数矩阵 ---
+        self.scores = momentum_score_matrix(close, self.cfg.lookback_days,
+                                            self.cfg.trading_days_per_year)
+
+        # --- 静态过滤：合约信息不变，只算一次 ---
+        static_ok = np.ones(m, dtype=bool)
+        total_value = np.zeros(m)
+        shares = np.zeros(m)
+        for j, stock in enumerate(panel.stocks):
+            detail = self._base_source.get_detail(stock)
+            if not detail:
+                static_ok[j] = False
+                continue
+            if self.cfg.exclude_st and 'ST' in (detail.get('InstrumentName', '') or '').upper():
+                static_ok[j] = False
+                continue
+            value = detail.get('TotalValue', 0) or 0
+            if value > 0:
+                total_value[j] = float(value)
+            else:
+                for key in ('TotalVolume', 'TotalVolumn', 'TotalShares'):
+                    got = detail.get(key, 0) or 0
+                    if got > 0:
+                        shares[j] = float(got)
+                        break
+
+        # --- 逐日过滤 ---
+        close_ok = np.isfinite(close) & (close > 0)
+
+        suspend = panel.field('suspendFlag')
+        if suspend is None:
+            susp_ok = np.ones((n, m), dtype=bool)
+        else:
+            susp_ok = ~(suspend == 1)
+
+        with np.errstate(invalid='ignore'):
+            cap = np.where(total_value[None, :] > 0, total_value[None, :],
+                           shares[None, :] * np.where(close_ok, close, np.nan))
+            cap_ok = ~(np.isfinite(cap) & (cap > 0)) | (
+                (cap >= self.cfg.min_market_cap) & (cap <= self.cfg.max_market_cap))
+
+        self.pool_mask = close_ok & susp_ok & cap_ok & static_ok[None, :]
+
+        # --- 跌停过滤（候选股用） ---
+        ratios = np.array([limit_ratio(s) if self.cfg.dynamic_limit_down else 0.10
+                           for s in panel.stocks])
+        pre_close = panel.field('preClose')
+        if pre_close is None:
+            pre_close = close
+        with np.errstate(invalid='ignore'):
+            limit_down = np.round(pre_close * (1 - ratios[None, :]), 2)
+            not_limit_down = ~(close <= limit_down)
+        self.tradable = close_ok & susp_ok & not_limit_down
+
+        # --- RSRS ---
+        self.rsrs = None
+        if self.cfg.rsrs_enabled:
+            index_df = self._base_source.get_one(self.cfg.rsrs_index,
+                                                 self.config.end_date, 0)
+            if index_df is not None and len(index_df) >= self.cfg.rsrs_m + self.cfg.rsrs_n:
+                values = rsrs_series(index_df['high'].to_numpy(dtype=float),
+                                     index_df['low'].to_numpy(dtype=float),
+                                     self.cfg.rsrs_n, self.cfg.rsrs_m)
+                dates = [str(d)[:8] for d in index_df.index]
+                lookup = dict(zip(dates, values))
+                self.rsrs = np.array([lookup.get(d, np.nan) for d in panel.dates])
+
+    # ---------- 单个交易日 ----------
+
+    def run_day(self, date: str) -> float:
+        log.info('=' * 56)
+        log.info('交易日: %s', date)
+
+        self.account.settle_open()
+        self._last_signal = ''
+        self.today_target = None
+
+        i = self.panel.date_pos.get(date)
+        if i is None:
+            log.info('非交易日或面板中无此日期，跳过')
+            return self.review(date)
+
+        candidates = self.pool_mask[i]
+        if not candidates.any():
+            log.info('股票池为空，跳过今日')
+            return self.review(date)
+        log.info('步骤1 - 股票池: %d 只', int(candidates.sum()))
+
+        row = self.scores[i]
+        usable = candidates & np.isfinite(row)
+        if not usable.any():
+            log.info('步骤2 - 未选出目标股票')
+            return self.review(date)
+
+        j = int(np.argmax(np.where(usable, row, -np.inf)))
+        target = self.panel.stocks[j]
+        log.info('步骤2 - 目标: %s %s（分数 %.4f）', target,
+                 self.source.get_stock_name(target), row[j])
+
+        scores = self.series_at(i, j)
+        self.score_series = {target: scores}
+        log.info('步骤3 - 动量分数序列: %s', [round(float(s), 4) for s in scores])
+
+        if not bool(self.tradable[i, j]):
+            log.info('步骤4 - 目标股票被过滤（停牌或跌停）')
+            return self.review(date)
+        self.today_target = target
+        log.info('步骤4 - 过滤通过: %s', target)
+
+        if self.rsrs is not None and np.isfinite(self.rsrs[i]):
+            log.info('RSRS修正标准分: %.4f', self.rsrs[i])
+        else:
+            log.info('RSRS修正标准分: 数据不足')
+
+        signal = timing_signal(scores, self.cfg) if scores else SIGNAL_KEEP
+        self._last_signal = signal
+        log.info('步骤5 - 择时信号: %s', signal)
+
+        self.adjust_position(date, target, signal)
+        log.info('步骤6 - 调仓执行完毕')
+
+        self.check_stop_loss(date)
+        return self.review(date)
+
+    def series_at(self, i: int, j: int) -> List[float]:
+        """动量分数序列：分数矩阵第 j 列的一段，缺失记 0.0（与逐日版一致）"""
+        length = self.cfg.score_series_len
+        if i - length < 0:
+            return []
+        window = self.scores[i - length:i + 1, j]
+        return [0.0 if not np.isfinite(v) else float(v) for v in window]
 
 
-def report(account, equity_curve):
-    print('\n' + '=' * 60)
-    print('[回测结果]')
-    print('=' * 60)
-    if not equity_curve:
-        print('无有效交易日')
-        return
+# ======================================================================
+# report.py
+# ======================================================================
 
-    dates = [d for d, _ in equity_curve]
-    values = np.array([v for _, v in equity_curve], dtype=float)
+"""回测绩效统计与输出。"""
 
-    total_return = values[-1] / account.init_cash - 1
-    days = len(values)
-    years = days / TRADING_DAYS_PER_YEAR
-    annual = (values[-1] / account.init_cash) ** (1 / years) - 1 if years > 0 and values[-1] > 0 else 0.0
+
+
+
+
+@dataclass
+class Performance:
+    start_date: str
+    end_date: str
+    trading_days: int
+    init_cash: float
+    final_asset: float
+    total_return: float
+    annual_return: float
+    max_drawdown: float
+    max_drawdown_date: str
+    sharpe: float
+    buy_count: int
+    sell_count: int
+    win_rate: float
+    total_fee: float
+
+
+def evaluate(result: BacktestResult, trading_days_per_year: int = 244) -> Optional[Performance]:
+    if not result.equity_curve:
+        return None
+
+    dates = result.dates
+    values = np.asarray(result.values, dtype=float)
+    account = result.account
+    init_cash = account.init_cash
+
+    total_return = values[-1] / init_cash - 1
+    years = len(values) / trading_days_per_year
+    if years > 0 and values[-1] > 0:
+        annual_return = (values[-1] / init_cash) ** (1 / years) - 1
+    else:
+        annual_return = 0.0
 
     peak = np.maximum.accumulate(values)
     drawdown = values / peak - 1
-    max_dd = drawdown.min() if len(drawdown) else 0.0
-    max_dd_date = dates[int(drawdown.argmin())] if len(drawdown) else ''
+    max_dd = float(drawdown.min())
+    max_dd_date = dates[int(drawdown.argmin())]
 
-    rets = np.diff(values) / values[:-1] if len(values) > 1 else np.array([])
-    if len(rets) > 1 and rets.std() > 0:
-        sharpe = rets.mean() / rets.std() * math.sqrt(TRADING_DAYS_PER_YEAR)
+    if len(values) > 1:
+        rets = np.diff(values) / values[:-1]
+        sharpe = float(rets.mean() / rets.std() * math.sqrt(trading_days_per_year)) \
+            if rets.std() > 0 else 0.0
     else:
         sharpe = 0.0
 
-    buy_cnt = len([d for d in account.deals if d.direction == 1])
-    sell_cnt = len([d for d in account.deals if d.direction == -1])
-    total_fee = sum(d.fee for d in account.deals)
+    sells = [d for d in account.deals if d.direction == SELL]
+    buys = [d for d in account.deals if d.direction != SELL]
+    wins = [d for d in sells if d.realized_pnl > 0]
+    win_rate = len(wins) / len(sells) if sells else 0.0
 
-    print(f'  区间: {dates[0]} ~ {dates[-1]}  共 {days} 个交易日')
-    print(f'  初始资金: {account.init_cash:,.0f}')
-    print(f'  期末资产: {values[-1]:,.0f}')
-    print(f'  总收益率: {total_return:.2%}')
-    print(f'  年化收益: {annual:.2%}')
-    print(f'  最大回撤: {max_dd:.2%} (于 {max_dd_date})')
-    print(f'  夏普比率: {sharpe:.2f}')
-    print(f'  成交笔数: 买入 {buy_cnt} / 卖出 {sell_cnt}，总费用 {total_fee:,.0f}')
-
-
-def run_backtest(start_date, end_date, init_cash=200000.0,
-                 use_cache=True, do_download=False, save_csv=''):
-    print('[动量择时策略-xtdata版] 初始化 ...')
-    print(f'  回测区间: {start_date} ~ {end_date}, 初始资金: {init_cash:,.0f}')
-    print(f'  概念板块数: {len(CONCEPT_SECTORS)}')
-    print(f'  动量回看: {LOOKBACK_DAYS}天, 止损线: {STOP_LOSS_RATIO:.0%}')
-
-    # 交易日历（额外向前取足够多的预热日，供 RSRS 使用）
-    warm_need = max(WARMUP_DAYS, RSRS_M + RSRS_N + 10)
-    run_days, warm_start = get_trading_days(start_date, end_date, extra_before=warm_need)
-    print(f'  交易日: {len(run_days)} 个, 数据预热起点: {warm_start}')
-
-    base_pool = build_base_pool()
-    print(f'  原始股票池: {len(base_pool)} 只')
-    if not base_pool:
-        print('股票池为空，请检查板块名称或 QMT 数据')
-        return None
-
-    if do_download:
-        download_data(base_pool + [RSRS_INDEX], warm_start, end_date)
-
-    data = BacktestData(use_cache=use_cache)
-    # 个股只需 LOOKBACK 级别的预热；指数需要 RSRS 的长历史，单独加载
-    stock_warm_start = get_trading_days(start_date, end_date, extra_before=WARMUP_DAYS + 5)[1]
-    data.preload(base_pool, stock_warm_start, end_date)
-    data.preload([RSRS_INDEX], warm_start, end_date)
-
-    account = SimAccount(init_cash)
-    state = {'stock_df': {}, 'today_target': None}
-
-    for bar_date in run_days:
-        total = run_one_day(data, bar_date, account, base_pool, state)
-        account.equity_curve.append((bar_date, total))
-
-    report(account, account.equity_curve)
-
-    if save_csv:
-        df = pd.DataFrame(account.equity_curve, columns=['date', 'total_asset'])
-        df.to_csv(save_csv, index=False, encoding='utf-8-sig')
-        print(f'[回测] 净值曲线已保存: {save_csv}')
-
-    return account
+    return Performance(
+        start_date=dates[0],
+        end_date=dates[-1],
+        trading_days=len(values),
+        init_cash=init_cash,
+        final_asset=float(values[-1]),
+        total_return=float(total_return),
+        annual_return=float(annual_return),
+        max_drawdown=max_dd,
+        max_drawdown_date=max_dd_date,
+        sharpe=sharpe,
+        buy_count=len(buys),
+        sell_count=len(sells),
+        win_rate=win_rate,
+        total_fee=float(sum(d.fee for d in account.deals)),
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser(description='动量择时策略 xtdata 回测')
-    parser.add_argument('--start', default='20240101', help='回测开始日期 YYYYMMDD')
-    parser.add_argument('--end', default=datetime.now().strftime('%Y%m%d'), help='回测结束日期 YYYYMMDD')
-    parser.add_argument('--cash', type=float, default=200000.0, help='初始资金')
-    parser.add_argument('--no-cache', action='store_true', help='关闭行情内存缓存，逐日直接查询 xtdata')
-    parser.add_argument('--download', action='store_true', help='回测前先补下载本地日线数据')
-    parser.add_argument('--save-csv', default='', help='净值曲线输出 csv 路径')
-    args = parser.parse_args()
+def format_report(perf: Optional[Performance]) -> str:
+    if perf is None:
+        return '[回测结果] 无有效交易日'
 
-    run_backtest(args.start, args.end, args.cash,
-                 use_cache=not args.no_cache,
-                 do_download=args.download,
-                 save_csv=args.save_csv)
+    lines = [
+        '=' * 56,
+        '[回测结果]',
+        '=' * 56,
+        f'  区间      : {perf.start_date} ~ {perf.end_date}（{perf.trading_days} 个交易日）',
+        f'  初始资金  : {perf.init_cash:,.0f}',
+        f'  期末资产  : {perf.final_asset:,.0f}',
+        f'  总收益率  : {perf.total_return:.2%}',
+        f'  年化收益  : {perf.annual_return:.2%}',
+        f'  最大回撤  : {perf.max_drawdown:.2%}（{perf.max_drawdown_date}）',
+        f'  夏普比率  : {perf.sharpe:.2f}',
+        f'  成交笔数  : 买入 {perf.buy_count} / 卖出 {perf.sell_count}',
+        f'  卖出胜率  : {perf.win_rate:.2%}',
+        f'  累计费用  : {perf.total_fee:,.0f}',
+    ]
+    return '\n'.join(lines)
+
+
+def equity_dataframe(result: BacktestResult) -> pd.DataFrame:
+    """
+    净值曲线。有每日快照时一并带上当日目标股、信号和收盘持仓，
+    没有快照（例如只手工拼了 equity_curve）时退化为最简三列。
+    """
+    if not result.daily:
+        df = pd.DataFrame(result.equity_curve, columns=['date', 'total_asset'])
+        df['nav'] = df['total_asset'] / result.account.init_cash
+        return df
+
+    rows = [asdict(d) for d in result.daily]
+    df = pd.DataFrame(rows)
+    df['nav'] = df['total_asset'] / result.account.init_cash
+    df['daily_return'] = df['total_asset'].pct_change().fillna(0.0)
+    df['drawdown'] = df['total_asset'] / df['total_asset'].cummax() - 1
+
+    df = df[['date', 'total_asset', 'nav', 'daily_return', 'drawdown',
+             'cash', 'market_value', 'stock', 'volume', 'cost', 'price',
+             'target', 'signal']]
+    return _round(df, {'total_asset': 2, 'nav': 6, 'daily_return': 6, 'drawdown': 6,
+                       'cash': 2, 'market_value': 2, 'cost': 4, 'price': 4})
+
+
+def deals_dataframe(result: BacktestResult,
+                    name_lookup: Optional[Callable[[str], str]] = None) -> pd.DataFrame:
+    columns = ['date', 'stock', 'name', 'direction', 'price', 'volume',
+               'amount', 'fee', 'realized_pnl', 'msg']
+    rows = [asdict(d) for d in result.account.deals]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    df = pd.DataFrame(rows)
+    df['name'] = [name_lookup(s) if name_lookup else '' for s in df['stock']]
+    df['amount'] = df['price'] * df['volume']
+    df['direction'] = df['direction'].map({1: '买入', -1: '卖出'})
+    return _round(df[columns], {'price': 4, 'amount': 2, 'fee': 2, 'realized_pnl': 2})
+
+
+def trades_dataframe(result: BacktestResult,
+                     name_lookup: Optional[Callable[[str], str]] = None) -> pd.DataFrame:
+    """
+    按先进先出把买卖配成一笔笔完整交易（开仓 -> 平仓），费用按成交量摊分。
+    尚未平仓的持仓不计入。
+    """
+    columns = ['stock', 'name', 'buy_date', 'buy_price', 'sell_date', 'sell_price',
+               'volume', 'hold_days', 'fee', 'pnl', 'return_pct', 'sell_reason']
+    lots: Dict[str, deque] = {}
+    rows = []
+
+    for deal in result.account.deals:
+        if deal.direction != SELL:
+            lots.setdefault(deal.stock, deque()).append(
+                {'date': deal.date, 'price': deal.price,
+                 'left': deal.volume, 'fee_per_share': deal.fee / max(deal.volume, 1)})
+            continue
+
+        remaining = deal.volume
+        sell_fee_per_share = deal.fee / max(deal.volume, 1)
+        queue = lots.get(deal.stock)
+        while remaining > 0 and queue:
+            lot = queue[0]
+            matched = min(remaining, lot['left'])
+            lot['left'] -= matched
+            remaining -= matched
+            if lot['left'] <= 0:
+                queue.popleft()
+
+            fee = (lot['fee_per_share'] + sell_fee_per_share) * matched
+            pnl = (deal.price - lot['price']) * matched - fee
+            cost = lot['price'] * matched
+            rows.append({
+                'stock': deal.stock,
+                'name': name_lookup(deal.stock) if name_lookup else '',
+                'buy_date': lot['date'],
+                'buy_price': lot['price'],
+                'sell_date': deal.date,
+                'sell_price': deal.price,
+                'volume': matched,
+                'hold_days': _days_between(lot['date'], deal.date),
+                'fee': fee,
+                'pnl': pnl,
+                'return_pct': pnl / cost if cost > 0 else 0.0,
+                'sell_reason': deal.msg,
+            })
+
+    return _round(pd.DataFrame(rows, columns=columns),
+                  {'buy_price': 4, 'sell_price': 4, 'fee': 2, 'pnl': 2, 'return_pct': 6})
+
+
+def _round(df: pd.DataFrame, digits: Dict[str, int]) -> pd.DataFrame:
+    """按列四舍五入，便于直接看 csv"""
+    out = df.copy()
+    for col, nd in digits.items():
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors='coerce').round(nd)
+    return out
+
+
+def _days_between(start: str, end: str) -> int:
+    try:
+        return (datetime.strptime(end, '%Y%m%d') - datetime.strptime(start, '%Y%m%d')).days
+    except (ValueError, TypeError):
+        return 0
+
+
+def save_results(result: BacktestResult, out_dir: str,
+                 perf: Optional[Performance] = None,
+                 name_lookup: Optional[Callable[[str], str]] = None,
+                 extra: Optional[dict] = None) -> Dict[str, str]:
+    """
+    把回测结果写到一个目录：
+      equity.csv   逐日净值 + 当日目标股 / 信号 / 持仓
+      deals.csv    每一笔成交
+      trades.csv   先进先出配对后的完整交易（含持有天数与收益率）
+      summary.json 绩效指标（机器读）
+      summary.txt  绩效指标（人读）
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    paths = {}
+
+    equity_path = os.path.join(out_dir, 'equity.csv')
+    equity_dataframe(result).to_csv(equity_path, index=False, encoding='utf-8-sig')
+    paths['equity'] = equity_path
+
+    deals_path = os.path.join(out_dir, 'deals.csv')
+    deals_dataframe(result, name_lookup).to_csv(deals_path, index=False, encoding='utf-8-sig')
+    paths['deals'] = deals_path
+
+    trades_path = os.path.join(out_dir, 'trades.csv')
+    trades_dataframe(result, name_lookup).to_csv(trades_path, index=False, encoding='utf-8-sig')
+    paths['trades'] = trades_path
+
+    payload = {'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    if extra:
+        payload.update(extra)
+    if perf is not None:
+        payload['performance'] = asdict(perf)
+
+    json_path = os.path.join(out_dir, 'summary.json')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    paths['summary_json'] = json_path
+
+    txt_path = os.path.join(out_dir, 'summary.txt')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(format_report(perf) + '\n')
+    paths['summary_txt'] = txt_path
+
+    print(f'[输出] 回测结果已保存到 {os.path.abspath(out_dir)}')
+    for name in ('equity.csv', 'deals.csv', 'trades.csv', 'summary.json', 'summary.txt'):
+        print(f'         {name}')
+    return paths
+
+
+def save_csv(result: BacktestResult, equity_path: str = '', deals_path: str = '') -> None:
+    if equity_path:
+        equity_dataframe(result).to_csv(equity_path, index=False, encoding='utf-8-sig')
+        print(f'[输出] 净值曲线: {equity_path}')
+    if deals_path:
+        deals_dataframe(result).to_csv(deals_path, index=False, encoding='utf-8-sig')
+        print(f'[输出] 成交明细: {deals_path}')
+
+
+# ======================================================================
+# sample_data.py
+# ======================================================================
+
+"""
+合成样例行情，用于单元测试和没有 QMT 环境时跑通完整流程。
+生成的数据结构与 CsvDataSource 期望的一致。
+"""
+
+
+
+DEFAULT_STOCKS = (
+    '600000.SH', '600519.SH', '000001.SZ', '300750.SZ',
+    '688981.SH', '000002.SZ', '002415.SZ', '601318.SH',
+)
+
+
+def make_calendar(days: int, start: str = '20220104') -> List[str]:
+    """用工作日近似交易日历"""
+    return pd.bdate_range(start=pd.Timestamp(start), periods=days).strftime('%Y%m%d').tolist()
+
+
+def make_bars(dates: Sequence[str], base_price: float = 20.0,
+              drift: float = 0.0005, vol: float = 0.02,
+              seed: int = 0) -> pd.DataFrame:
+    """按几何布朗运动生成一只标的的日线"""
+    rng = np.random.default_rng(seed)
+    rets = rng.normal(drift, vol, len(dates))
+    close = base_price * np.exp(np.cumsum(rets))
+    pre_close = np.concatenate([[base_price], close[:-1]])
+    open_ = pre_close * (1 + rng.normal(0, 0.004, len(dates)))
+    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.005, len(dates))))
+    low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.005, len(dates))))
+
+    return pd.DataFrame({
+        'open': open_, 'high': high, 'low': low, 'close': close,
+        'preClose': pre_close,
+        'volume': rng.integers(1e5, 1e6, len(dates)).astype(float),
+        'suspendFlag': np.zeros(len(dates)),
+    }, index=list(dates))
+
+
+def make_sample_frames(days: int = 700, stocks: Sequence[str] = DEFAULT_STOCKS,
+                       index_code: str = '000300.SH',
+                       start: str = '20220104', seed: int = 7):
+    """返回 (frames, details, sectors)，可直接喂给 CsvDataSource.from_frames"""
+    dates = make_calendar(days, start)
+
+    frames: Dict[str, pd.DataFrame] = {}
+    details: Dict[str, dict] = {}
+    for i, stock in enumerate(stocks):
+        frames[stock] = make_bars(dates, base_price=10 + i * 4,
+                                  drift=0.0002 + i * 0.0002, seed=seed + i)
+        details[stock] = {
+            'InstrumentName': f'样例{stock[:6]}',
+            'TotalValue': float(100e8 + i * 20e8),
+        }
+
+    if index_code:
+        frames[index_code] = make_bars(dates, base_price=3800, drift=0.0001,
+                                       vol=0.01, seed=seed + 99)
+        details[index_code] = {'InstrumentName': '沪深300', 'TotalValue': 0.0}
+
+    sectors = {'沪深A股': list(stocks)}
+    return frames, details, sectors
+
+
+def write_sample_dir(data_dir: str, days: int = 700,
+                     stocks: Sequence[str] = DEFAULT_STOCKS,
+                     index_code: str = '000300.SH',
+                     start: str = '20220104', seed: int = 7) -> str:
+    """把样例数据写成 CsvDataSource 目录结构，返回目录路径"""
+    frames, details, sectors = make_sample_frames(days, stocks, index_code, start, seed)
+
+    bars_dir = os.path.join(data_dir, 'bars')
+    os.makedirs(bars_dir, exist_ok=True)
+    for stock, df in frames.items():
+        out = df.copy()
+        out.index.name = 'date'
+        out.to_csv(os.path.join(bars_dir, f'{stock}.csv'), encoding='utf-8')
+
+    with open(os.path.join(data_dir, 'instruments.json'), 'w', encoding='utf-8') as f:
+        json.dump(details, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(data_dir, 'sectors.json'), 'w', encoding='utf-8') as f:
+        json.dump(sectors, f, ensure_ascii=False, indent=2)
+
+    return data_dir
+
+
+def make_source(days: int = 700, stocks: Sequence[str] = DEFAULT_STOCKS,
+                index_code: Optional[str] = '000300.SH',
+                start: str = '20220104', seed: int = 7):
+    """直接构造一个内存 CsvDataSource"""
+
+    frames, details, sectors = make_sample_frames(days, stocks, index_code or '', start, seed)
+    return CsvDataSource.from_frames(frames, details, sectors)
+
+
+# ======================================================================
+# diagnostics.py
+# ======================================================================
+
+"""
+xtdata 数据自检。
+
+逐步确认：能否 import xtquant -> 交易日历 -> 板块成分 -> 合约信息 ->
+日线数据（按 count 取 / 按区间取）-> 必要时试下载一只标的再重试。
+每一步都把 xtdata 的真实返回打出来，便于定位到底卡在哪一环。
+
+    python run_backtest.py --check-data
+    python run_backtest.py --check-data --download        # 自检时顺便试下载
+"""
+
+
+DEFAULT_SAMPLES = ('000300.SH', '600000.SH', '000001.SZ')
+
+OK = '[OK]  '
+BAD = '[FAIL]'
+WARN = '[WARN]'
+
+
+def _p(tag: str, msg: str) -> None:
+    print(f'{tag} {msg}')
+
+
+def check_xtdata(samples: Sequence[str] = DEFAULT_SAMPLES,
+                 sector: str = '沪深A股',
+                 start_date: str = '20240101',
+                 end_date: str = '20241231',
+                 try_download: bool = False) -> bool:
+    """返回 True 表示日线数据可用"""
+    print('=' * 56)
+    print('xtdata 数据自检')
+    print('=' * 56)
+
+    # 1. 导入
+    try:
+        from xtquant import xtdata
+    except Exception as e:
+        _p(BAD, f'import xtquant 失败: {e}')
+        print('  xtquant 随 QMT 安装，一般在 <QMT安装目录>\\bin.x64\\Lib\\site-packages')
+        print('  把该目录加入 PYTHONPATH，或直接用 QMT 自带的 python 运行')
+        return False
+    _p(OK, f'import xtquant 成功（{getattr(xtdata, "__file__", "?")}）')
+
+    # 2. 交易日历
+    try:
+        dates = xtdata.get_trading_dates('SH', start_time='', end_time=end_date, count=-1)
+        days = [xtdata.timetag_to_datetime(t, '%Y%m%d') for t in dates]
+        _p(OK, f'交易日历 {len(days)} 个交易日，最后一个 {days[-1] if days else "无"}')
+    except Exception as e:
+        _p(BAD, f'get_trading_dates 失败: {e}（QMT 客户端可能未启动或未登录）')
+        return False
+
+    # 3. 板块
+    try:
+        stocks = xtdata.get_stock_list_in_sector(sector) or []
+        _p(OK 
+           if stocks else WARN,
+           f'板块 {sector}: {len(stocks)} 只' + (f'，示例 {stocks[:3]}' if stocks else '（为空，检查板块名）'))
+    except Exception as e:
+        _p(BAD, f'get_stock_list_in_sector 失败: {e}')
+        stocks = []
+
+    # 4. 合约信息
+    probe = list(samples)
+    for stock in probe[:1]:
+        try:
+            detail = xtdata.get_instrument_detail(stock)
+            if detail:
+                _p(OK, f'{stock} 合约信息: 名称={detail.get("InstrumentName")} '
+                       f'TotalValue={detail.get("TotalValue")}')
+                missing = [k for k in ('TotalValue', 'TotalVolume', 'TotalVolumn', 'TotalShares')
+                           if k in detail]
+                _p(OK, f'  市值相关字段: {missing or "无（市值过滤会被跳过）"}')
+            else:
+                _p(WARN, f'{stock} 合约信息为空')
+        except Exception as e:
+            _p(BAD, f'get_instrument_detail 失败: {e}')
+
+    # 5. 日线：按 count 取
+    ok_count = _probe_bars(xtdata, probe, mode='count')
+    # 6. 日线：按区间取
+    ok_range = _probe_bars(xtdata, probe, mode='range',
+                           start_date=start_date, end_date=end_date)
+
+    if ok_count or ok_range:
+        _p(OK, '日线数据可用，可以直接跑回测')
+        return True
+
+    _p(BAD, '日线数据取不到 —— 本地大概率没有下载过日线')
+
+    if not try_download:
+        print('\n处理办法（任选其一）：')
+        print('  1. 回测命令加 --download，让脚本先补下载')
+        print('  2. 在 QMT 客户端「行情 -> 数据管理 / 数据下载」里补充日线数据')
+        print('  3. 再跑一次 --check-data --download，让自检直接试一只标的的下载')
+        return False
+
+    # 7. 试下载一只再重试
+    target = probe[0]
+    _p(WARN, f'尝试下载 {target} 的日线 ...')
+    try:
+        xtdata.download_history_data(target, period='1d',
+                                     start_time=start_date, end_time=end_date)
+    except Exception as e:
+        _p(BAD, f'download_history_data 失败: {e}')
+        return False
+
+    if _probe_bars(xtdata, [target], mode='range',
+                   start_date=start_date, end_date=end_date):
+        _p(OK, f'{target} 下载后可正常读取 —— 整体补下载即可（回测加 --download）')
+        return True
+
+    _p(BAD, f'{target} 下载后仍读不到数据，请检查客户端数据权限与磁盘数据目录')
+    return False
+
+
+def _probe_bars(xtdata, stocks: Sequence[str], mode: str,
+                start_date: str = '', end_date: str = '') -> bool:
+    """分别用完整字段和核心字段探测，打印返回形状"""
+
+    for label, fields in (('完整字段', DAILY_FIELDS), ('核心字段', CORE_FIELDS)):
+        kwargs = dict(period='1d', dividend_type='none', fill_data=True)
+        if mode == 'count':
+            kwargs.update(count=5)
+            desc = f'count=5 / {label}'
+        else:
+            kwargs.update(start_time=start_date, end_time=end_date, count=-1)
+            desc = f'{start_date}~{end_date} / {label}'
+
+        try:
+            data = xtdata.get_market_data_ex(list(fields), list(stocks), **kwargs)
+        except Exception as e:
+            _p(BAD, f'get_market_data_ex({desc}) 抛异常: {e}')
+            continue
+
+        shapes = {s: (0 if data.get(s) is None else len(data[s])) for s in stocks}
+        got = [s for s, n in shapes.items() if n > 0]
+        if got:
+            sample = data[got[0]]
+            _p(OK, f'get_market_data_ex({desc}) 返回 {shapes}')
+            _p(OK, f'  {got[0]} 列: {list(sample.columns)}')
+            _p(OK, f'  最后一行: {sample.tail(1).to_dict("records")}')
+            return True
+        _p(WARN, f'get_market_data_ex({desc}) 全部为空 {shapes}')
+
+    return False
+
+
+# ======================================================================
+# cli.py
+# ======================================================================
+
+"""命令行入口。"""
+
+
+
+
+def setup_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format='%(message)s',
+        stream=sys.stdout,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog='momentum', description='动量择时策略回测')
+    p.add_argument('--start', default='20240101', help='回测开始日期 YYYYMMDD')
+    p.add_argument('--end', default=datetime.now().strftime('%Y%m%d'), help='回测结束日期 YYYYMMDD')
+    p.add_argument('--cash', type=float, default=200000.0, help='初始资金')
+
+    p.add_argument('--source', choices=['xtdata', 'csv'], default='xtdata', help='数据源')
+    p.add_argument('--data-dir', default='', help='csv 数据源目录（--source csv 时必填）')
+    p.add_argument('--no-cache', action='store_true', help='xtdata 数据源关闭内存缓存')
+    p.add_argument('--download', action='store_true', help='回测前先补下载本地日线')
+    p.add_argument('--check-data', action='store_true',
+                   help='只做 xtdata 数据自检并退出（配合 --download 会试下载一只标的）')
+
+    p.add_argument('--sectors', default='', help='板块名，逗号分隔，默认 ' + ','.join(CONCEPT_SECTORS_DEFAULT))
+    p.add_argument('--lookback', type=int, default=StrategyConfig.lookback_days, help='动量回看天数')
+    p.add_argument('--stop-loss', type=float, default=StrategyConfig.stop_loss_ratio, help='止损线，如 -0.15')
+    p.add_argument('--decline-days', type=int, default=StrategyConfig.decline_days_to_sell,
+                   help='动量分数连续下降几天清仓')
+    p.add_argument('--min-cap', type=float, default=StrategyConfig.min_market_cap, help='市值下限')
+    p.add_argument('--max-cap', type=float, default=StrategyConfig.max_market_cap, help='市值上限')
+    p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
+
+    p.add_argument('--engine', choices=['fast', 'loop'], default='fast',
+                   help='fast=向量化引擎（默认）；loop=逐日引擎，慢很多，用于交叉验证')
+    p.add_argument('--out-dir', default='',
+                   help='回测结果输出目录，默认 results/bt_<起止日期>_<时间戳>')
+    p.add_argument('--no-save', action='store_true', help='不保存回测结果')
+    p.add_argument('--equity-csv', default='', help='额外单独输出净值曲线到指定路径')
+    p.add_argument('--deals-csv', default='', help='额外单独输出成交明细到指定路径')
+    p.add_argument('-q', '--quiet', action='store_true', help='只输出最终统计')
+    return p
+
+
+def build_source(args):
+    if args.source == 'csv':
+        if not args.data_dir:
+            raise SystemExit('--source csv 需要同时指定 --data-dir')
+        return CsvDataSource(args.data_dir)
+
+    return XtDataSource(use_cache=not args.no_cache)
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    setup_logging(not args.quiet)
+
+    if args.check_data:
+        ok = check_xtdata(start_date=args.start, end_date=args.end,
+                          try_download=args.download)
+        return 0 if ok else 1
+
+    sectors = tuple(s.strip() for s in args.sectors.split(',') if s.strip()) \
+        or CONCEPT_SECTORS_DEFAULT
+
+    config = BacktestConfig(
+        start_date=args.start,
+        end_date=args.end,
+        strategy=StrategyConfig(
+            concept_sectors=sectors,
+            lookback_days=args.lookback,
+            stop_loss_ratio=args.stop_loss,
+            decline_days_to_sell=args.decline_days,
+            min_market_cap=args.min_cap,
+            max_market_cap=args.max_cap,
+            rsrs_enabled=not args.no_rsrs,
+        ),
+        account=AccountConfig(init_cash=args.cash),
+    )
+
+    engine_cls = VectorBacktestEngine if args.engine == 'fast' else BacktestEngine
+    engine = engine_cls(build_source(args), config)
+
+    started = time.time()
+    result = engine.run(download=args.download, show_progress=args.quiet)
+    elapsed = time.time() - started
+
+    perf = evaluate(result, config.strategy.trading_days_per_year)
+    print(format_report(perf))
+    print(f'  回测耗时  : {elapsed:.1f} 秒（{args.engine} 引擎）')
+
+    if not args.no_save:
+        out_dir = args.out_dir or os.path.join(
+            'results', f'bt_{args.start}_{args.end}_{datetime.now().strftime("%H%M%S")}')
+        save_results(
+            result, out_dir, perf,
+            name_lookup=engine.source.get_stock_name,
+            extra={
+                'start_date': args.start,
+                'end_date': args.end,
+                'init_cash': args.cash,
+                'engine': args.engine,
+                'elapsed_seconds': round(elapsed, 2),
+                'sectors': list(sectors),
+                'strategy': asdict(config.strategy),
+                'account': asdict(config.account),
+            },
+        )
+
+    save_csv(result, args.equity_csv, args.deals_csv)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

@@ -22,6 +22,39 @@ RSRS 修正标准分（N=21, M=600, 沪深300）**只计算和打印，不参与
 
 所有打分取数都多取 1 根 K 线并用 `[-(n+1):-1]` 切片排除当日，不含未来函数。
 
+## 性能
+
+选股环节是纯矩阵运算：股票池过滤、动量打分、RSRS 全部一次性算成
+(交易日 × 标的) 的矩阵，而不是逐日逐股票切 DataFrame 再调 `np.polyfit`。
+5000 只 × 250 个交易日原本要跑 125 万次回归，现在压成几次矩阵运算。
+
+合成数据实测（260 个交易日）：
+
+| 股票池 | 逐日引擎 | 向量引擎 | 提速 |
+|---|---|---|---|
+| 50 只 | 7.1 s | 0.19 s | 38× |
+| 300 只 | 30.4 s | 0.43 s | 70× |
+
+股票数越多差距越大，全市场（5000+ 只）差距在两个数量级以上。
+两个引擎的下单、止损、复盘是同一份代码，测试里逐笔比对过结果完全相同
+（`tests/test_vector_engine.py`）。`--engine loop` 可切回逐日引擎做交叉验证。
+
+一处行为差异：面板按交易日历对齐，某只标的当日没有数据即视为当日不可交易；
+逐日引擎会沿用它最近一根 K 线（已退市标的会一直参与打分）。行情完整时两者一致。
+
+## 回测结果
+
+每次回测默认写到 `results/bt_<起止日期>_<时间戳>/`（`--out-dir` 可指定，
+`--no-save` 关闭）：
+
+| 文件 | 内容 |
+|---|---|
+| `equity.csv` | 逐日净值：总资产、净值、当日收益、回撤、现金、市值，以及当天的目标股、择时信号、收盘持仓 |
+| `deals.csv` | 每一笔成交：日期、代码、名称、方向、价格、数量、金额、费用、已实现盈亏、下单原因 |
+| `trades.csv` | 先进先出配对后的完整交易：买卖日期与价格、持有天数、费用、盈亏、收益率、卖出原因 |
+| `summary.json` | 绩效指标 + 本次回测用的全部参数（便于复现） |
+| `summary.txt` | 绩效指标的可读版本 |
+
 ## 参数
 
 全部集中在 `momentum/config.py`，数值与原脚本一一对应：
@@ -79,7 +112,8 @@ python run_backtest.py --check-data --download   # 顺便试下载一只标的
 
 常用参数：`--lookback` 回看天数、`--stop-loss` 止损线、`--decline-days` 连续下降
 清仓天数、`--min-cap/--max-cap` 市值区间、`--sectors` 板块（逗号分隔）、
-`--no-rsrs` 跳过 RSRS、`--no-cache` 关闭行情内存缓存、`-q` 只输出最终统计。
+`--no-rsrs` 跳过 RSRS、`--no-cache` 关闭行情内存缓存、`--engine loop` 切回逐日引擎、
+`--out-dir` 指定结果目录、`--no-save` 不保存结果、`-q` 只输出进度条和最终统计。
 
 ## 项目结构
 
@@ -95,11 +129,15 @@ momentum_strategy/
 │   ├── broker.py       # 模拟账户：T+1、佣金、印花税、成交流水
 │   ├── engine.py       # 回测引擎：交易日循环、调仓、止损、复盘
 │   ├── report.py       # 绩效统计与 csv 输出
+│   ├── panel.py        # 向量化行情面板与滚动回归核
+│   ├── vector_engine.py# 向量化回测引擎（默认）
 │   ├── sample_data.py  # 合成样例行情
 │   ├── diagnostics.py  # xtdata 数据自检
 │   ├── progress.py     # 终端进度条
 │   └── cli.py          # 命令行入口
-├── tools/make_sample_data.py
+├── tools/
+│   ├── make_sample_data.py   # 生成样例行情
+│   └── build_standalone.py   # 把包打包成单文件 dl_strategy_xtdata.py
 ├── tests/              # pytest，不依赖 QMT
 └── run_backtest.py
 ```
@@ -113,10 +151,11 @@ momentum_strategy/
 python -m pytest
 ```
 
-91 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
+121 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
 「当日 K 线不参与打分」的未来函数检查）、股票池过滤、择时信号、T+1 与费用、
 调仓与止损、绩效统计，以及 xtdata 取数行为（分批、字段退回、无数据报错，
-用桩 xtquant 注入，不需要 QMT），以及进度条渲染。
+用桩 xtquant 注入，不需要 QMT）、进度条渲染、
+向量化指标与 polyfit 的数值一致性、两个引擎的逐笔结果一致性、结果文件落盘。
 
 ## 与原 QMT 脚本的差异
 
@@ -152,3 +191,15 @@ python -m pytest
   依赖 `m_nCanUseVolume` 的行为一致
 - 市值过滤用的是 `get_instrument_detail` 的当前值，历史回测存在轻微前视偏差
 - 模拟撮合按给定价格全额成交，不含滑点和冲击成本，实盘结果会更差
+
+## 单文件版
+
+仓库根目录的 `dl_strategy_xtdata.py` 由本项目自动生成，方便直接丢进 QMT 目录
+或拷到别的机器：
+
+```bash
+python tools/build_standalone.py            # 重新生成
+python tools/build_standalone.py --check    # 校验是否与包同步（测试里会跑）
+```
+
+改逻辑请改 `momentum/` 下的模块再重新生成，不要直接编辑单文件版。

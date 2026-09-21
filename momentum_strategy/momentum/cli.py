@@ -3,13 +3,17 @@
 
 import argparse
 import logging
+import os
 import sys
+import time
+from dataclasses import asdict
 from datetime import datetime
 
 from .config import (CONCEPT_SECTORS_DEFAULT, AccountConfig, BacktestConfig,
                      StrategyConfig)
 from .engine import BacktestEngine
-from .report import evaluate, format_report, save_csv
+from .report import evaluate, format_report, save_csv, save_results
+from .vector_engine import VectorBacktestEngine
 
 
 def setup_logging(verbose: bool) -> None:
@@ -42,13 +46,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--max-cap', type=float, default=StrategyConfig.max_market_cap, help='市值上限')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
 
-    p.add_argument('--equity-csv', default='', help='净值曲线输出路径')
-    p.add_argument('--deals-csv', default='', help='成交明细输出路径')
+    p.add_argument('--engine', choices=['fast', 'loop'], default='fast',
+                   help='fast=向量化引擎（默认）；loop=逐日引擎，慢很多，用于交叉验证')
+    p.add_argument('--out-dir', default='',
+                   help='回测结果输出目录，默认 results/bt_<起止日期>_<时间戳>')
+    p.add_argument('--no-save', action='store_true', help='不保存回测结果')
+    p.add_argument('--equity-csv', default='', help='额外单独输出净值曲线到指定路径')
+    p.add_argument('--deals-csv', default='', help='额外单独输出成交明细到指定路径')
     p.add_argument('-q', '--quiet', action='store_true', help='只输出最终统计')
     return p
 
 
-def make_source(args):
+def build_source(args):
     if args.source == 'csv':
         from .datasource import CsvDataSource
         if not args.data_dir:
@@ -87,11 +96,35 @@ def main(argv=None) -> int:
         account=AccountConfig(init_cash=args.cash),
     )
 
-    engine = BacktestEngine(make_source(args), config)
-    result = engine.run(download=args.download)
+    engine_cls = VectorBacktestEngine if args.engine == 'fast' else BacktestEngine
+    engine = engine_cls(build_source(args), config)
+
+    started = time.time()
+    result = engine.run(download=args.download, show_progress=args.quiet)
+    elapsed = time.time() - started
 
     perf = evaluate(result, config.strategy.trading_days_per_year)
     print(format_report(perf))
+    print(f'  回测耗时  : {elapsed:.1f} 秒（{args.engine} 引擎）')
+
+    if not args.no_save:
+        out_dir = args.out_dir or os.path.join(
+            'results', f'bt_{args.start}_{args.end}_{datetime.now().strftime("%H%M%S")}')
+        save_results(
+            result, out_dir, perf,
+            name_lookup=engine.source.get_stock_name,
+            extra={
+                'start_date': args.start,
+                'end_date': args.end,
+                'init_cash': args.cash,
+                'engine': args.engine,
+                'elapsed_seconds': round(elapsed, 2),
+                'sectors': list(sectors),
+                'strategy': asdict(config.strategy),
+                'account': asdict(config.account),
+            },
+        )
+
     save_csv(result, args.equity_csv, args.deals_csv)
     return 0
 

@@ -4,8 +4,8 @@
 
 | 目录 / 文件 | 说明 |
 |---|---|
-| [`momentum_strategy/`](momentum_strategy/) | **推荐**。分层的独立项目：配置 / 指标 / 数据源 / 选股 / 择时 / 撮合 / 引擎 / 统计分离，带 91 个单元测试，可用合成数据离线跑通 |
-| `dl_strategy_xtdata.py` | 单文件版，逻辑相同，适合直接丢进 QMT 目录或快速改参数 |
+| [`momentum_strategy/`](momentum_strategy/) | **推荐**。分层的独立项目：配置 / 指标 / 数据源 / 选股 / 择时 / 撮合 / 引擎 / 统计分离，带 121 个单元测试，可用合成数据离线跑通 |
+| `dl_strategy_xtdata.py` | 单文件版，**由 `momentum_strategy/tools/build_standalone.py` 自动生成**，适合直接丢进 QMT 目录。改逻辑请改包里的模块再重新生成 |
 
 两者逻辑和参数一致，都源自 QMT 回测脚本 `dl_strategy.py`。
 
@@ -13,7 +13,8 @@
 
 原版跑在 QMT 客户端内置回测里（`init` / `handlebar` / `passorder`），本版改成
 可以直接 `python` 运行的独立脚本：行情走 `xtquant.xtdata`，交易由脚本内的
-`SimAccount` 模拟撮合。
+`SimAccount` 模拟撮合。文件由包自动生成，功能与项目版完全一致（含向量化引擎和
+结果保存），测试里会比对两者输出逐字节相同。
 
 ## 环境
 
@@ -43,7 +44,7 @@ python dl_strategy_xtdata.py --start 20240101 --end 20241231 --no-cache   # 关�
 ```bash
 cd momentum_strategy
 pip install -r requirements-dev.txt
-python -m pytest                                      # 91 个用例，不需要 QMT
+python -m pytest                                      # 121 个用例，不需要 QMT
 
 # 离线试跑（任何平台）
 python tools/make_sample_data.py --out data/sample --days 700

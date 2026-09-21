@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .broker import SimAccount
 from .config import BacktestConfig
 from .datasource import DataSource
+from .progress import Progress
 from .selector import filter_target, momentum_series, pick_target, price_and_limits
 from .timing import SIGNAL_SELL, rsrs_value, timing_signal
 from .universe import build_base_pool, filter_universe
@@ -23,10 +24,27 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class DailyRecord:
+    """每个交易日收盘后的快照，用于保存回测结果"""
+
+    date: str
+    target: str = ''          # 当日选出的目标股
+    signal: str = ''          # 择时信号
+    stock: str = ''           # 收盘持仓
+    volume: int = 0
+    cost: float = 0.0
+    price: float = 0.0
+    market_value: float = 0.0
+    cash: float = 0.0
+    total_asset: float = 0.0
+
+
+@dataclass
 class BacktestResult:
     account: SimAccount
     equity_curve: List[Tuple[str, float]] = field(default_factory=list)
     signals: List[Tuple[str, str, Optional[str]]] = field(default_factory=list)  # (日期, 信号, 目标股)
+    daily: List[DailyRecord] = field(default_factory=list)
 
     @property
     def dates(self) -> List[str]:
@@ -99,7 +117,7 @@ class BacktestEngine:
             )
         return self.base_pool
 
-    def run(self, download: bool = False) -> BacktestResult:
+    def run(self, download: bool = False, show_progress: bool = False) -> BacktestResult:
         log.info('回测区间: %s ~ %s，初始资金: %.0f',
                  self.config.start_date, self.config.end_date, self.account.init_cash)
         log.info('板块数: %d，动量回看: %d 天，止损线: %.0f%%',
@@ -113,15 +131,35 @@ class BacktestEngine:
             raise RuntimeError('股票池为空，请检查板块名称或数据源')
 
         result = BacktestResult(account=self.account)
-        for date in run_days:
+        bar = Progress(len(run_days), prefix='[回测] 交易日', enabled=show_progress)
+        for n, date in enumerate(run_days, 1):
             total = self.run_day(date)
             result.equity_curve.append((date, total))
             result.signals.append((date, self._last_signal, self.today_target))
+            result.daily.append(self.daily_record(date, total))
+            bar.update(n, suffix=date)
+        bar.close()
         return result
+
+    def daily_record(self, date: str, total: float) -> DailyRecord:
+        """收盘快照。策略最多持有 1 只，取第一只持仓即可"""
+        record = DailyRecord(date=date, target=self.today_target or '',
+                             signal=self._last_signal, cash=self.account.cash,
+                             total_asset=total)
+        for pos in self.account.get_positions():
+            price = self._last_price_map.get(pos.stock, pos.open_price)
+            record.stock = pos.stock
+            record.volume = pos.volume
+            record.cost = pos.open_price
+            record.price = price
+            record.market_value = price * pos.volume
+            break
+        return record
 
     # ---------- 单个交易日 ----------
 
     _last_signal = ''
+    _last_price_map: Dict[str, float] = {}
 
     def run_day(self, date: str) -> float:
         log.info('=' * 56)
@@ -262,6 +300,7 @@ class BacktestEngine:
                      pos.stock, self.source.get_stock_name(pos.stock),
                      pos.open_price, close, profit * 100, close * pos.volume)
 
+        self._last_price_map = price_map
         total = self.account.total_asset(price_map)
         log.info('  资金 可用:%.0f 总资产:%.0f', self.account.cash, total)
         return total
