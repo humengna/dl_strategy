@@ -950,6 +950,24 @@ NO_DATA_HINT = """
   3. 运行 python run_backtest.py --check-data 逐步定位到底哪一步取不到数
 """
 
+# 复权因子是独立的一份数据（除权除息），不随日线一起下载。
+# 缺它时 get_market_data_ex(dividend_type='back'/'front') 会直接返回空表，
+# 表象和"没下载日线"一模一样，所以要单独识别并给出正确的处理办法。
+DIVIDEND_PERIOD = 'divid_factors'
+
+MISSING_DIVIDEND_HINT = """
+[数据] 日线数据是有的，但按「{mode}」复权取不到 —— 缺的是除权除息因子。
+
+  复权因子（{period}）是独立于日线的一份数据，不随日线一起下载，
+  所以昨天下过日线、今天换成复权口径依然会取不到。
+
+  处理办法（任选其一）：
+    1. 加 --download 重跑，脚本会连同除权除息因子一起补下载
+    2. 在 QMT 客户端「行情 -> 数据管理」里补充除权除息数据
+    3. 先用 --dividend-type none 跑不复权（注意：除权跳空会被当成真实下跌，
+       分红股的动量分数会被严重压低）
+"""
+
 
 class DataSource(object):
     """数据源接口"""
@@ -1091,6 +1109,27 @@ class XtDataSource(DataSource):
     def _any_rows(data) -> bool:
         return any(df is not None and len(df) > 0 for df in data.values())
 
+    def probe_dividend(self, sample_stocks, start_date='', end_date='') -> bool:
+        """
+        当前复权方式取不到数、但不复权能取到时，说明缺的是除权除息因子。
+        返回 True 表示确认是复权因子缺失（已打印提示）。
+        """
+        if self.dividend_type == 'none':
+            return False
+
+        sample = list(sample_stocks)[:3]
+        saved, self.dividend_type = self.dividend_type, 'none'
+        try:
+            has_raw = self._any_rows(self._raw_fetch(CORE_FIELDS, sample, start_date, end_date))
+        finally:
+            self.dividend_type = saved
+
+        if has_raw:
+            print(MISSING_DIVIDEND_HINT.format(mode=self.dividend_type,
+                                               period=DIVIDEND_PERIOD))
+            return True
+        return False
+
     def resolve_fields(self, sample_stocks, start_date='', end_date='') -> bool:
         """
         用少量标的探测可用字段。
@@ -1119,7 +1158,8 @@ class XtDataSource(DataSource):
               f'（复权: {self.dividend_type}）...')
 
         if not self.resolve_fields(stocks, start_date, end_date):
-            print(NO_DATA_HINT)
+            if not self.probe_dividend(stocks, start_date, end_date):
+                print(NO_DATA_HINT)
             return
 
         loaded = 0
@@ -1192,17 +1232,33 @@ class XtDataSource(DataSource):
 
     def download(self, stocks, start_date, end_date, show_progress: bool = True):
         """
-        补下载本地日线，带进度显示。
+        补下载本地数据：日线 + 除权除息因子。
 
-        优先用 download_history_data2 + callback（xtdata 会实时回调下载进度）；
-        该接口或 callback 参数不可用时，退回逐只下载并自己统计进度。
+        复权价要靠除权除息因子算，这份数据不随日线一起下载，
+        只下日线的话换成复权口径依然取不到数。
         """
         stocks = list(dict.fromkeys(stocks))
         if not stocks:
             return
 
-        print(f'[数据] 开始下载日线: {len(stocks)} 只，{start_date} ~ {end_date}')
-        bar = Progress(len(stocks), prefix='[数据] 下载', enabled=show_progress)
+        self._download_period(stocks, '1d', '日线', start_date, end_date, show_progress)
+        if self.dividend_type != 'none':
+            self.download_dividend_factors(stocks, start_date, end_date, show_progress)
+
+    def download_dividend_factors(self, stocks: Sequence[str], start_date: str,
+                                  end_date: str, show_progress: bool = True) -> None:
+        """补下载除权除息因子（复权价的来源）"""
+        stocks = list(dict.fromkeys(stocks))
+        if not stocks:
+            return
+        self._download_period(stocks, DIVIDEND_PERIOD, '除权除息因子',
+                              start_date, end_date, show_progress)
+
+    def _download_period(self, stocks: Sequence[str], period: str, label: str,
+                         start_date: str, end_date: str, show_progress: bool = True):
+        """下载某个周期的数据：优先批量+进度回调，不支持则逐级降级"""
+        print(f'[数据] 开始下载{label}: {len(stocks)} 只，{start_date} ~ {end_date}')
+        bar = Progress(len(stocks), prefix=f'[数据] {label}', enabled=show_progress)
 
         def _callback(data):
             """xtdata 回调，data 形如 {'finished': n, 'total': m, 'stockcode': '600000.SH'}"""
@@ -1218,28 +1274,28 @@ class XtDataSource(DataSource):
         batch = getattr(self._xtdata, 'download_history_data2', None)
         if batch is not None:
             try:
-                batch(stocks, period='1d', start_time=start_date,
+                batch(stocks, period=period, start_time=start_date,
                       end_time=end_date, callback=_callback)
                 bar.close()
-                print('[数据] 下载完成')
+                print(f'[数据] {label}下载完成')
                 return
             except TypeError:
                 # 该版本的 download_history_data2 不接受 callback
                 try:
-                    batch(stocks, period='1d', start_time=start_date, end_time=end_date)
+                    batch(stocks, period=period, start_time=start_date, end_time=end_date)
                     bar.update(len(stocks))
                     bar.close()
-                    print('[数据] 下载完成（该版本不支持进度回调）')
+                    print(f'[数据] {label}下载完成（该版本不支持进度回调）')
                     return
                 except Exception as e:
-                    print(f'[数据] 批量下载失败，改为逐只下载: {e}')
+                    print(f'[数据] {label}批量下载失败，改为逐只下载: {e}')
             except Exception as e:
-                print(f'[数据] 批量下载失败，改为逐只下载: {e}')
+                print(f'[数据] {label}批量下载失败，改为逐只下载: {e}')
 
         failed = []
         for i, stock in enumerate(stocks, 1):
             try:
-                self._xtdata.download_history_data(stock, period='1d',
+                self._xtdata.download_history_data(stock, period=period,
                                                    start_time=start_date, end_time=end_date)
             except Exception as e:
                 failed.append((stock, str(e)))
@@ -1247,9 +1303,9 @@ class XtDataSource(DataSource):
         bar.close()
 
         if failed:
-            print(f'[数据] 下载完成，{len(failed)} 只失败，例如 {failed[:3]}')
+            print(f'[数据] {label}下载完成，{len(failed)} 只失败，例如 {failed[:3]}')
         else:
-            print('[数据] 下载完成')
+            print(f'[数据] {label}下载完成')
 
 
 class CsvDataSource(DataSource):
@@ -1783,7 +1839,9 @@ class BacktestEngine:
         if not self.source.has_data(self.base_pool, self.config.end_date):
             raise RuntimeError(
                 '数据源取不到任何日线数据，回测无法开始。\n'
-                '  - 加 --download 让脚本补下载，或在 QMT 客户端「行情 -> 数据管理」补充日线\n'
+                '  - 若上面提示「缺的是除权除息因子」，加 --download 补下载，\n'
+                '    或先用 --dividend-type none 跑不复权\n'
+                '  - 否则加 --download 补下载日线，或在 QMT 客户端「行情 -> 数据管理」补充\n'
                 '  - 用 python run_backtest.py --check-data 逐步定位'
             )
         return self.base_pool
@@ -2127,7 +2185,9 @@ class VectorBacktestEngine(BacktestEngine):
         if not len(self.panel) or not self.panel.stocks:
             raise RuntimeError(
                 '数据源取不到任何日线数据，回测无法开始。\n'
-                '  - 加 --download 让脚本补下载，或在 QMT 客户端「行情 -> 数据管理」补充日线\n'
+                '  - 若上面提示「缺的是除权除息因子」，加 --download 补下载，\n'
+                '    或先用 --dividend-type none 跑不复权\n'
+                '  - 否则加 --download 补下载日线，或在 QMT 客户端「行情 -> 数据管理」补充\n'
                 '  - 用 python run_backtest.py --check-data 逐步定位'
             )
         log.info('面板规模: %d 个交易日 × %d 只标的', *self.panel.shape)
@@ -2746,11 +2806,24 @@ def check_xtdata(samples: Sequence[str] = DEFAULT_SAMPLES,
         _p(OK, '日线数据可用，可以直接跑回测')
         return True
 
+    # 7. 复权因子缺失时，复权价取不到但不复权能取到 —— 表象和「没下载日线」一样
+    if DEFAULT_DIVIDEND_TYPE != 'none':
+        if _probe_bars(xtdata, probe, mode='range', start_date=start_date,
+                       end_date=end_date, dividend_type='none'):
+            _p(BAD, f'日线有数据，但按「{DEFAULT_DIVIDEND_TYPE}」复权取不到 '
+                    f'—— 缺的是除权除息因子（{DIVIDEND_PERIOD}）')
+            print('  复权因子是独立于日线的一份数据，不随日线一起下载。')
+            print('  处理办法：')
+            print('    1. 回测命令加 --download，会连同除权除息因子一起补下载')
+            print('    2. 在 QMT 客户端「行情 -> 数据管理」里补充除权除息数据')
+            print('    3. 先用 --dividend-type none 跑不复权（除权跳空会被当成真实下跌）')
+            return False
+
     _p(BAD, '日线数据取不到 —— 本地大概率没有下载过日线')
 
     if not try_download:
         print('\n处理办法（任选其一）：')
-        print('  1. 回测命令加 --download，让脚本先补下载')
+        print('  1. 回测命令加 --download，让脚本先补下载（含除权除息因子）')
         print('  2. 在 QMT 客户端「行情 -> 数据管理 / 数据下载」里补充日线数据')
         print('  3. 再跑一次 --check-data --download，让自检直接试一只标的的下载')
         return False
@@ -2779,13 +2852,15 @@ def _probe_bars(xtdata, stocks: Sequence[str], mode: str,
     """分别用完整字段和核心字段探测，打印返回形状"""
 
     for label, fields in (('完整字段', DAILY_FIELDS), ('核心字段', CORE_FIELDS)):
-        kwargs = dict(period='1d', dividend_type=DEFAULT_DIVIDEND_TYPE, fill_data=True)
+        kwargs = dict(period='1d', fill_data=True,
+                      dividend_type=dividend_type or DEFAULT_DIVIDEND_TYPE)
         if mode == 'count':
             kwargs.update(count=5)
-            desc = f'count=5 / {label}'
+            desc = f"count=5 / {label} / 复权 {kwargs['dividend_type']}"
         else:
             kwargs.update(start_time=start_date, end_time=end_date, count=-1)
-            desc = f'{start_date}~{end_date} / {label}'
+            desc = (f'{start_date}~{end_date} / {label}'
+                    f" / 复权 {kwargs['dividend_type']}")
 
         try:
             data = xtdata.get_market_data_ex(list(fields), list(stocks), **kwargs)

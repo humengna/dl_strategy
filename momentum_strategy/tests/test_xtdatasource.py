@@ -21,14 +21,17 @@ class FakeXtdata:
 
     def __init__(self, stocks, days=30, supports_suspend_flag=True,
                  has_local_data=True, max_batch=None,
-                 batch_download=False, batch_callback=True):
+                 batch_download=False, batch_callback=True,
+                 has_dividend_factors=True):
         self.stocks = list(stocks)
         self.dates = pd.bdate_range('20240102', periods=days).strftime('%Y%m%d').tolist()
         self.supports_suspend_flag = supports_suspend_flag
         self.has_local_data = has_local_data
         self.max_batch = max_batch
+        self.has_dividend_factors = has_dividend_factors
         self.calls = []
         self.downloaded = []
+        self.downloaded_factors = []
         if batch_download:
             self.download_history_data2 = (self._batch_with_callback if batch_callback
                                            else self._batch_without_callback)
@@ -56,6 +59,9 @@ class FakeXtdata:
         empty = {s: pd.DataFrame() for s in stock_list}
         if not self.has_local_data:
             return empty
+        # 复权价要靠除权除息因子算，缺因子时 xtdata 直接返回空表
+        if dividend_type != 'none' and not self.has_dividend_factors:
+            return empty
         if self.max_batch is not None and len(stock_list) > self.max_batch:
             return empty
         if 'suspendFlag' in field_list and not self.supports_suspend_flag:
@@ -76,18 +82,29 @@ class FakeXtdata:
         return out
 
     def download_history_data(self, stock, period='1d', start_time='', end_time=''):
+        if period == 'divid_factors':
+            self.downloaded_factors.append(stock)
+            self.has_dividend_factors = True
+            return
         self.downloaded.append(stock)
 
     def _batch_with_callback(self, stock_list, period='1d', start_time='',
                              end_time='', callback=None, incrementally=None):
         total = len(stock_list)
+        target = (self.downloaded_factors if period == 'divid_factors' else self.downloaded)
+        if period == 'divid_factors':
+            self.has_dividend_factors = True
         for i, stock in enumerate(stock_list, 1):
-            self.downloaded.append(stock)
+            target.append(stock)
             if callback is not None:
                 callback({'finished': i, 'total': total, 'stockcode': stock, 'message': ''})
 
     def _batch_without_callback(self, stock_list, period='1d', start_time='', end_time=''):
         # 旧版本签名里没有 callback，传了就抛 TypeError
+        if period == 'divid_factors':
+            self.downloaded_factors.extend(stock_list)
+            self.has_dividend_factors = True
+            return
         self.downloaded.extend(stock_list)
 
 
@@ -202,7 +219,7 @@ def test_download_reports_progress_via_callback(make_xt, capsys):
 
     out = capsys.readouterr().out
     assert '开始下载日线: 20 只' in out
-    assert '[数据] 下载' in out
+    assert '[数据] 日线' in out
     assert '100.0%' in out
     assert '20/20' in out
     assert '下载完成' in out
@@ -310,3 +327,62 @@ def test_invalid_dividend_type_rejected(make_xt):
     make_xt()                                          # 装好桩 xtquant
     with pytest.raises(ValueError, match='复权'):
         XtDataSource(dividend_type='qfq')
+
+
+# ---------------- 缺除权除息因子 ----------------
+
+def test_missing_dividend_factors_is_diagnosed(make_xt, capsys):
+    """日线有、复权因子没有 —— 表象和「没下载日线」一样，必须分辨出来"""
+    source, fake = make_xt(has_dividend_factors=False)
+    source.preload(['600000.SH', '000001.SZ'], '20240102', '20240229')
+
+    out = capsys.readouterr().out
+    assert '缺的是除权除息因子' in out
+    assert 'divid_factors' in out
+    assert '--dividend-type none' in out
+    assert '没有返回任何日线数据' not in out      # 不该给出误导性的旧提示
+    assert source._cache == {}
+
+
+def test_no_data_at_all_keeps_original_hint(make_xt, capsys):
+    source, fake = make_xt(has_local_data=False)
+    source.preload(['600000.SH'], '20240102', '20240229')
+
+    out = capsys.readouterr().out
+    assert '没有返回任何日线数据' in out
+    assert '缺的是除权除息因子' not in out
+
+
+def test_unadjusted_source_does_not_report_dividend_problem(make_xt, capsys):
+    source, fake = make_xt(has_local_data=False)
+    source.dividend_type = 'none'
+    source.preload(['600000.SH'], '20240102', '20240229')
+    assert '除权除息因子' not in capsys.readouterr().out
+
+
+def test_download_also_fetches_dividend_factors(make_xt, capsys):
+    stocks = ['600000.SH', '000001.SZ']
+    source, fake = make_xt(stocks=stocks, batch_download=True,
+                           has_dividend_factors=False)
+
+    source.download(stocks, '20240102', '20240229')
+
+    assert fake.downloaded == stocks            # 日线
+    assert fake.downloaded_factors == stocks    # 除权除息因子
+    out = capsys.readouterr().out
+    assert '除权除息因子' in out
+
+    # 补下载之后复权价就取得到了
+    source.preload(stocks, '20240102', '20240229')
+    assert set(source._cache) == set(stocks)
+
+
+def test_download_skips_factors_when_unadjusted(make_xt):
+    stocks = ['600000.SH']
+    source, fake = make_xt(stocks=stocks, batch_download=True)
+    source.dividend_type = 'none'
+
+    source.download(stocks, '20240102', '20240229')
+
+    assert fake.downloaded == stocks
+    assert fake.downloaded_factors == []

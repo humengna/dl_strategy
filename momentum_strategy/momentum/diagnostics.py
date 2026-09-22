@@ -88,11 +88,25 @@ def check_xtdata(samples: Sequence[str] = DEFAULT_SAMPLES,
         _p(OK, '日线数据可用，可以直接跑回测')
         return True
 
+    # 7. 复权因子缺失时，复权价取不到但不复权能取到 —— 表象和「没下载日线」一样
+    from .datasource import DEFAULT_DIVIDEND_TYPE, DIVIDEND_PERIOD
+    if DEFAULT_DIVIDEND_TYPE != 'none':
+        if _probe_bars(xtdata, probe, mode='range', start_date=start_date,
+                       end_date=end_date, dividend_type='none'):
+            _p(BAD, f'日线有数据，但按「{DEFAULT_DIVIDEND_TYPE}」复权取不到 '
+                    f'—— 缺的是除权除息因子（{DIVIDEND_PERIOD}）')
+            print('  复权因子是独立于日线的一份数据，不随日线一起下载。')
+            print('  处理办法：')
+            print('    1. 回测命令加 --download，会连同除权除息因子一起补下载')
+            print('    2. 在 QMT 客户端「行情 -> 数据管理」里补充除权除息数据')
+            print('    3. 先用 --dividend-type none 跑不复权（除权跳空会被当成真实下跌）')
+            return False
+
     _p(BAD, '日线数据取不到 —— 本地大概率没有下载过日线')
 
     if not try_download:
         print('\n处理办法（任选其一）：')
-        print('  1. 回测命令加 --download，让脚本先补下载')
+        print('  1. 回测命令加 --download，让脚本先补下载（含除权除息因子）')
         print('  2. 在 QMT 客户端「行情 -> 数据管理 / 数据下载」里补充日线数据')
         print('  3. 再跑一次 --check-data --download，让自检直接试一只标的的下载')
         return False
@@ -123,13 +137,15 @@ def _probe_bars(xtdata, stocks: Sequence[str], mode: str,
     from .datasource import CORE_FIELDS, DEFAULT_DIVIDEND_TYPE
 
     for label, fields in (('完整字段', DAILY_FIELDS), ('核心字段', CORE_FIELDS)):
-        kwargs = dict(period='1d', dividend_type=DEFAULT_DIVIDEND_TYPE, fill_data=True)
+        kwargs = dict(period='1d', fill_data=True,
+                      dividend_type=dividend_type or DEFAULT_DIVIDEND_TYPE)
         if mode == 'count':
             kwargs.update(count=5)
-            desc = f'count=5 / {label}'
+            desc = f"count=5 / {label} / 复权 {kwargs['dividend_type']}"
         else:
             kwargs.update(start_time=start_date, end_time=end_date, count=-1)
-            desc = f'{start_date}~{end_date} / {label}'
+            desc = (f'{start_date}~{end_date} / {label}'
+                    f" / 复权 {kwargs['dividend_type']}")
 
         try:
             data = xtdata.get_market_data_ex(list(fields), list(stocks), **kwargs)

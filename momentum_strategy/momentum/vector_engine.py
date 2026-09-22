@@ -134,7 +134,9 @@ class VectorBacktestEngine(BacktestEngine):
         if not len(self.panel) or not self.panel.stocks:
             raise RuntimeError(
                 '数据源取不到任何日线数据，回测无法开始。\n'
-                '  - 加 --download 让脚本补下载，或在 QMT 客户端「行情 -> 数据管理」补充日线\n'
+                '  - 若上面提示「缺的是除权除息因子」，加 --download 补下载，\n'
+                '    或先用 --dividend-type none 跑不复权\n'
+                '  - 否则加 --download 补下载日线，或在 QMT 客户端「行情 -> 数据管理」补充\n'
                 '  - 用 python run_backtest.py --check-data 逐步定位'
             )
         log.info('面板规模: %d 个交易日 × %d 只标的', *self.panel.shape)
