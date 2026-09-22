@@ -25,7 +25,8 @@ from .datasource import DataSource
 from .engine import BacktestEngine
 from .indicators import limit_ratio
 from .panel import Panel, momentum_score_matrix, rsrs_series
-from .timing import SIGNAL_KEEP, timing_signal
+from .timing import (SIGNAL_BUY, SIGNAL_KEEP, SIGNAL_SELL, rsrs_value,
+                     timing_signal)
 from .universe import build_base_pool
 
 log = logging.getLogger(__name__)
@@ -249,6 +250,7 @@ class VectorBacktestEngine(BacktestEngine):
         if i is None:
             log.info('非交易日或面板中无此日期，跳过')
             return self.review(date)
+        self._row = i
 
         candidates = self.pool_mask[i]
         if not candidates.any():
@@ -262,35 +264,75 @@ class VectorBacktestEngine(BacktestEngine):
             log.info('步骤2 - 未选出目标股票')
             return self.review(date)
 
-        j = int(np.argmax(np.where(usable, row, -np.inf)))
-        target = self.panel.stocks[j]
-        log.info('步骤2 - 目标: %s %s（分数 %.4f）', target,
-                 self.source.get_stock_name(target), row[j])
+        picks = self.top_indices(i, usable, self.cfg.max_positions)
+        names = [self.panel.stocks[j] for j in picks]
+        log.info('步骤2 - 目标: %s',
+                 [f'{n}（{row[j]:.4f}）' for n, j in zip(names, picks)])
 
-        scores = self.series_at(i, j)
-        self.score_series = {target: scores}
-        log.info('步骤3 - 动量分数序列: %s', [round(float(s), 4) for s in scores])
+        self.score_series = {n: self.series_at(i, j) for n, j in zip(names, picks)}
+        log.info('步骤3 - 首选动量分数序列: %s',
+                 [round(float(x), 4) for x in self.score_series.get(names[0], [])])
 
-        if not bool(self.tradable[i, j]):
-            log.info('步骤4 - 目标股票被过滤（停牌或跌停）')
+        targets = [n for n, j in zip(names, picks) if bool(self.tradable[i, j])]
+        if not targets:
+            log.info('步骤4 - 目标股票全部被过滤（停牌或跌停）')
             return self.review(date)
-        self.today_target = target
-        log.info('步骤4 - 过滤通过: %s', target)
+        self.today_target = targets[0]
+        log.info('步骤4 - 过滤通过: %s', targets)
 
         if self.rsrs is not None and np.isfinite(self.rsrs[i]):
             log.info('RSRS修正标准分: %.4f', self.rsrs[i])
         else:
             log.info('RSRS修正标准分: 数据不足')
 
-        signal = timing_signal(scores, self.cfg) if scores else SIGNAL_KEEP
+        signal, to_sell = self.resolve_signals(date, targets)
         self._last_signal = signal
-        log.info('步骤5 - 择时信号: %s', signal)
+        log.info('步骤5 - 择时信号: %s%s', signal,
+                 f'  待卖出: {sorted(to_sell)}' if to_sell else '')
 
-        self.adjust_position(date, target, signal)
+        # 原策略口径下 SELL 意味着「清仓且当日不再买入」，保持该语义；
+        # 其余情况统一走组合调仓（max_positions=1 时与原逻辑完全等价）
+        if not self.cfg.timing_on_holdings and signal == SIGNAL_SELL:
+            self.adjust_portfolio(date, [], to_sell=to_sell, allow_buy=False)
+        else:
+            keep = [t for t in targets if t not in to_sell]
+            self.adjust_portfolio(date, keep, to_sell=to_sell)
         log.info('步骤6 - 调仓执行完毕')
 
         self.check_stop_loss(date)
         return self.review(date)
+
+    def top_indices(self, i: int, usable: np.ndarray, count: int) -> List[int]:
+        """取当日分数最高的 count 个列号（按分数降序）"""
+        row = np.where(usable, self.scores[i], -np.inf)
+        count = min(max(count, 1), int(usable.sum()))
+        if count == 1:
+            return [int(np.argmax(row))]
+        idx = np.argpartition(-row, count - 1)[:count]
+        return [int(j) for j in idx[np.argsort(-row[idx])]]
+
+    def holding_series(self, date: str, stock: str) -> List[float]:
+        """持仓股的动量分数序列：在面板里就切矩阵列，否则回落到逐只计算"""
+        j = self.panel.stock_pos.get(stock)
+        i = getattr(self, '_row', None)
+        if j is None or i is None:
+            from .selector import momentum_series
+            return momentum_series(self.source, stock, date, self.cfg)
+        return self.series_at(i, j)
+
+    def resolve_signals(self, date: str, targets):
+        if not self.cfg.timing_on_holdings:
+            return super().resolve_signals(date, targets)
+
+        to_sell = set()
+        for stock in self.account.holdings_can_use():
+            series = self.holding_series(date, stock)
+            self.score_series[stock] = series
+            if series and timing_signal(series, self.cfg) == SIGNAL_SELL:
+                to_sell.add(stock)
+        if to_sell:
+            return SIGNAL_SELL, to_sell
+        return (SIGNAL_BUY if targets else SIGNAL_KEEP), to_sell
 
     def series_at(self, i: int, j: int) -> List[float]:
         """动量分数序列：分数矩阵第 j 列的一段，缺失记 0.0（与逐日版一致）"""

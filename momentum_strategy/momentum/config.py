@@ -49,6 +49,24 @@ class StrategyConfig:
     # 动量分数序列长度（原脚本固定取 5，再补最新 1 个，共 6 个）
     score_series_len: int = 5
 
+    # ---- 组合构建（默认等同原策略：满仓单票）----
+    # 同时持有的标的数，等权分配。1 = 原策略的满仓单票
+    max_positions: int = 1
+    # 仓位系数：投入资金 = 总资产 × 该系数，其余留现金。
+    # 满仓(1.0) 对这个策略是严重过度下注 —— 实测 μ=0.38%/天、σ=8.2%/天，
+    # 凯利最优 k*=μ/σ²≈0.56，且左侧比右侧安全，建议 0.3~0.4
+    position_ratio: float = 1.0
+
+    # 择时信号的判断对象。False = 原策略：判断「当天新选出的候选股」，
+    # 而候选股是当天分数最高的那只，序列几乎必然上升，导致 SELL 几乎不触发；
+    # True = 判断「当前持仓股」，连续下降才真正成为止盈/止损机制
+    timing_on_holdings: bool = False
+
+    # 一字涨停拦截用哪个价。'low' = 原脚本：当日最低价（未来函数，
+    # 实际只拦住全天封板，放过了开盘涨停、盘中打开的票）；
+    # 'open' = 开盘价，开盘时点已知
+    limit_up_block_field: str = 'low'
+
     # 择时：动量分数连续下降达到该天数则清仓
     decline_days_to_sell: int = 2
     # 判定「下降」的最小幅度。0.0 = 与原脚本一致的严格比较；
@@ -87,6 +105,12 @@ class StrategyConfig:
     def __post_init__(self):
         if self.warmup_days <= 0:
             self.warmup_days = self.lookback_days + 10
+        if self.max_positions < 1:
+            raise ValueError('max_positions 至少为 1')
+        if not 0 < self.position_ratio <= 1:
+            raise ValueError('position_ratio 必须在 (0, 1] 之间')
+        if self.limit_up_block_field not in ('low', 'open'):
+            raise ValueError("limit_up_block_field 只能是 'low' 或 'open'")
 
     @property
     def bars_needed_for_rank(self) -> int:
@@ -139,3 +163,18 @@ class BacktestConfig:
     end_date: str = '20241231'
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     account: AccountConfig = field(default_factory=AccountConfig)
+
+
+# 优化版预设：基于 2020-2026 实测数据的诊断（波动损耗 σ²/2 吃掉算术收益的 90%）
+#   - 降仓位：凯利最优 k*≈0.56，取更保守的 0.35（左侧比右侧安全）
+#   - 分散持仓：组合方差 σ²(1/N + (1-1/N)ρ)，N=5 时显著降波动
+#   - 择时盯持仓：原逻辑判断候选股，SELL 只占 3%，形同虚设
+#   - 回看 29 天：原脚本注释里的值，5 天是追一周爆发、波动的主要来源
+#   - 一字涨停按开盘价拦截：去掉最后一处未来函数
+OPTIMIZED_PRESET = {
+    'max_positions': 5,
+    'position_ratio': 0.35,
+    'timing_on_holdings': True,
+    'limit_up_block_field': 'open',
+    'lookback_days': 29,
+}

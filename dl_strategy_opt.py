@@ -1,19 +1,26 @@
 # coding: utf-8
 """
-A股动量择时策略 [xtdata 单文件版]
+A股动量择时策略 [优化版单文件]
 
-热门概念池 + 对数线性回归动量打分 + RSRS修正标准分 + 动量分数连续下降择时
-+ 固定 -15% 硬止损。行情走 xtquant.xtdata，交易由内置 SimAccount 模拟撮合。
+在原策略基础上按实测诊断做了五项调整（默认全部开启）：
+  1. 仓位系数 0.35     —— 凯利最优 k*=μ/σ²≈0.56，取更保守值
+  2. 5 只等权分散       —— 组合方差 σ²(1/N+(1-1/N)ρ)，显著降波动
+  3. 择时盯当前持仓     —— 原逻辑判断候选股，SELL 几乎不触发
+  4. 动量回看 29 天     —— 原脚本注释里的值，5 天是波动的主要来源
+  5. 涨停按开盘价拦截   —— 原用当日最低价，是最后一处未来函数
+
+诊断依据（2020-2026 满仓单票实测）：算术日均 +0.3756%/天、日波动 8.20%/天，
+波动损耗 σ²/2 = 0.3363%/天，吃掉算术收益的 90%，几何日均只剩 +0.0394%。
 
 !! 本文件由 momentum_strategy/tools/build_standalone.py 自动生成，请勿直接修改 !!
    改动请提交到 momentum_strategy/momentum/ 下的模块，再重新生成。
 
 运行
 ----
-  python dl_strategy_xtdata.py --start 20240101 --end 20241231 --cash 200000
-  python dl_strategy_xtdata.py --start 20240101 --end 20241231 --download
-  python dl_strategy_xtdata.py --check-data
-  结果默认保存到 results/bt_<起止日期>_<时间戳>/
+  python dl_strategy_opt.py --start 20200101 --end 20260918 --cash 1000000 -q
+  python dl_strategy_opt.py --check-data
+  加 --max-positions 1 --position-ratio 1 可退回原策略口径做对照
+  结果默认保存到 results/bt_<起止日期>_..._opt_.../
 """
 
 import argparse
@@ -3400,4 +3407,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(main(['--optimized'] + sys.argv[1:]))

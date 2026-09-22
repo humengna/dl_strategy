@@ -1,0 +1,38 @@
+{
+  "600000.SH": {
+    "InstrumentName": "样例600000",
+    "TotalValue": 10000000000.0
+  },
+  "600519.SH": {
+    "InstrumentName": "样例600519",
+    "TotalValue": 12000000000.0
+  },
+  "000001.SZ": {
+    "InstrumentName": "样例000001",
+    "TotalValue": 14000000000.0
+  },
+  "300750.SZ": {
+    "InstrumentName": "样例300750",
+    "TotalValue": 16000000000.0
+  },
+  "688981.SH": {
+    "InstrumentName": "样例688981",
+    "TotalValue": 18000000000.0
+  },
+  "000002.SZ": {
+    "InstrumentName": "样例000002",
+    "TotalValue": 20000000000.0
+  },
+  "002415.SZ": {
+    "InstrumentName": "样例002415",
+    "TotalValue": 22000000000.0
+  },
+  "601318.SH": {
+    "InstrumentName": "样例601318",
+    "TotalValue": 24000000000.0
+  },
+  "000300.SH": {
+    "InstrumentName": "沪深300",
+    "TotalValue": 0.0
+  }
+}

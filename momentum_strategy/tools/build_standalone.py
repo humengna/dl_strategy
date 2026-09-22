@@ -18,6 +18,7 @@ import sys
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = os.path.join(HERE, 'momentum')
 DEFAULT_OUT = os.path.join(os.path.dirname(HERE), 'dl_strategy_xtdata.py')
+OPTIMIZED_OUT = os.path.join(os.path.dirname(HERE), 'dl_strategy_opt.py')
 
 # 依赖顺序：被依赖的排前面
 MODULES = [
@@ -95,7 +96,35 @@ def top_level_names(source):
     return names
 
 
-def build():
+OPTIMIZED_HEADER = '''# coding: utf-8
+"""
+A股动量择时策略 [优化版单文件]
+
+在原策略基础上按实测诊断做了五项调整（默认全部开启）：
+  1. 仓位系数 0.35     —— 凯利最优 k*=μ/σ²≈0.56，取更保守值
+  2. 5 只等权分散       —— 组合方差 σ²(1/N+(1-1/N)ρ)，显著降波动
+  3. 择时盯当前持仓     —— 原逻辑判断候选股，SELL 几乎不触发
+  4. 动量回看 29 天     —— 原脚本注释里的值，5 天是波动的主要来源
+  5. 涨停按开盘价拦截   —— 原用当日最低价，是最后一处未来函数
+
+诊断依据（2020-2026 满仓单票实测）：算术日均 +0.3756%/天、日波动 8.20%/天，
+波动损耗 σ²/2 = 0.3363%/天，吃掉算术收益的 90%，几何日均只剩 +0.0394%。
+
+!! 本文件由 momentum_strategy/tools/build_standalone.py 自动生成，请勿直接修改 !!
+   改动请提交到 momentum_strategy/momentum/ 下的模块，再重新生成。
+
+运行
+----
+  python dl_strategy_opt.py --start 20200101 --end 20260918 --cash 1000000 -q
+  python dl_strategy_opt.py --check-data
+  加 --max-positions 1 --position-ratio 1 可退回原策略口径做对照
+  结果默认保存到 results/bt_<起止日期>_..._opt_.../
+"""
+
+'''
+
+
+def build(optimized: bool = False):
     imports = []
     chunks = []
     seen_names = {}
@@ -115,36 +144,45 @@ def build():
         chunks.append(f'# {"=" * 70}\n# {name}.py\n# {"=" * 70}\n\n{body}\n')
 
     unique_imports = sorted(set(imports), key=lambda s: (not s.startswith('import'), s))
-    parts = [HEADER, '\n'.join(unique_imports), '\n\n']
+    parts = [OPTIMIZED_HEADER if optimized else HEADER,
+             '\n'.join(unique_imports), '\n\n']
     parts.append('\n\n'.join(chunks))
-    parts.append("\n\nif __name__ == '__main__':\n    raise SystemExit(main())\n")
+    if optimized:
+        parts.append("\n\nif __name__ == '__main__':\n"
+                     "    raise SystemExit(main(['--optimized'] + sys.argv[1:]))\n")
+    else:
+        parts.append("\n\nif __name__ == '__main__':\n    raise SystemExit(main())\n")
     return ''.join(parts)
 
 
 def main():
     parser = argparse.ArgumentParser(description='生成单文件版策略脚本')
-    parser.add_argument('--out', default=DEFAULT_OUT, help='输出路径')
     parser.add_argument('--check', action='store_true', help='只检查现有文件是否与包同步')
     args = parser.parse_args()
 
-    content = build()
-    ast.parse(content)          # 生成物必须语法正确
+    targets = [(DEFAULT_OUT, False), (OPTIMIZED_OUT, True)]
+    contents = []
+    for out, optimized in targets:
+        content = build(optimized)
+        ast.parse(content)      # 生成物必须语法正确
+        contents.append((out, content))
 
     if args.check:
-        if not os.path.isfile(args.out):
-            print(f'{args.out} 不存在，请先运行 python tools/build_standalone.py')
-            return 1
-        with open(args.out, encoding='utf-8') as f:
-            current = f.read()
-        if current != content:
-            print(f'{args.out} 与 momentum 包不同步，请重新生成')
-            return 1
-        print(f'{args.out} 已是最新')
+        for out, content in contents:
+            if not os.path.isfile(out):
+                print(f'{out} 不存在，请先运行 python tools/build_standalone.py')
+                return 1
+            with open(out, encoding='utf-8') as f:
+                if f.read() != content:
+                    print(f'{out} 与 momentum 包不同步，请重新生成')
+                    return 1
+        print('单文件版均为最新')
         return 0
 
-    with open(args.out, 'w', encoding='utf-8') as f:
-        f.write(content)
-    print(f'已生成 {args.out}（{len(content.splitlines())} 行）')
+    for out, content in contents:
+        with open(out, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f'已生成 {out}（{len(content.splitlines())} 行）')
     return 0
 
 

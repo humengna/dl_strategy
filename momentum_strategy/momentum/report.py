@@ -124,8 +124,8 @@ def equity_dataframe(result: BacktestResult) -> pd.DataFrame:
     df['drawdown'] = df['total_asset'] / df['total_asset'].cummax() - 1
 
     df = df[['date', 'total_asset', 'nav', 'daily_return', 'drawdown',
-             'cash', 'market_value', 'stock', 'volume', 'cost', 'price',
-             'target', 'signal']]
+             'cash', 'market_value', 'position_count', 'holdings',
+             'stock', 'volume', 'cost', 'price', 'target', 'signal']]
     return _round(df, {'total_asset': 2, 'nav': 6, 'daily_return': 6, 'drawdown': 6,
                        'cash': 2, 'market_value': 2, 'cost': 4, 'price': 4})
 

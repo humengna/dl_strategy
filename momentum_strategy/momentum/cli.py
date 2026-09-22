@@ -10,8 +10,8 @@ import unicodedata
 from dataclasses import asdict
 from datetime import datetime
 
-from .config import (CONCEPT_SECTORS_DEFAULT, AccountConfig, BacktestConfig,
-                     StrategyConfig)
+from .config import (CONCEPT_SECTORS_DEFAULT, OPTIMIZED_PRESET, AccountConfig,
+                     BacktestConfig, StrategyConfig)
 from .datasource import DEFAULT_DIVIDEND_TYPE, DIVIDEND_TYPES
 from .engine import BacktestEngine
 from .report import evaluate, format_report, save_csv, save_results
@@ -53,6 +53,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--no-cap-filter', action='store_true',
                    help='关闭市值过滤，股票池取整个板块（对照 QMT 原脚本市值过滤失效时的口径）')
     p.add_argument('--no-rsrs', action='store_true', help='跳过 RSRS 计算（默认只打印不参与决策）')
+    p.add_argument('--optimized', action='store_true',
+                   help='优化版预设：%d 只等权 + 仓位 %.0f%%%% + 择时盯持仓 + 回看 %d 天 '
+                        '+ 涨停按开盘价拦截' % (
+                            OPTIMIZED_PRESET['max_positions'],
+                            OPTIMIZED_PRESET['position_ratio'] * 100,
+                            OPTIMIZED_PRESET['lookback_days']))
+    p.add_argument('--max-positions', type=int, default=StrategyConfig.max_positions,
+                   help='同时持有的标的数，等权分配，默认 1（满仓单票）')
+    p.add_argument('--position-ratio', type=float, default=StrategyConfig.position_ratio,
+                   help='仓位系数，投入资金 = 总资产 × 该系数，默认 1.0（满仓）。'
+                        '实测凯利最优约 0.56，建议取更保守的 0.3~0.4')
+    p.add_argument('--timing-on-holdings', action='store_true',
+                   help='择时判断当前持仓而非候选股。原逻辑判断候选股，SELL 几乎不触发')
+    p.add_argument('--limit-up-check', choices=['low', 'open'],
+                   default=StrategyConfig.limit_up_block_field,
+                   help="涨停拦截用哪个价：low=原脚本（当日最低价，未来函数）、open=开盘价")
     p.add_argument('--replicate-qmt', action='store_true',
                    help='完全复刻原 QMT 脚本的行为（含它的已知缺陷），'
                         '会覆盖下面这些开关：市值过滤关闭、不复权、跌停过滤按固定 10%%、'
@@ -127,6 +143,22 @@ def apply_qmt_preset(args) -> None:
         print('  （原脚本会按前收填充价脱手，实盘做不到；加 --allow-sell-suspended 可对齐）')
 
 
+def apply_optimized_preset(args) -> None:
+    """切到优化版口径（基于实测诊断：波动损耗吃掉算术收益的 90%）"""
+    args.max_positions = OPTIMIZED_PRESET['max_positions']
+    args.position_ratio = OPTIMIZED_PRESET['position_ratio']
+    args.timing_on_holdings = OPTIMIZED_PRESET['timing_on_holdings']
+    args.limit_up_check = OPTIMIZED_PRESET['limit_up_block_field']
+    if args.lookback == [StrategyConfig.lookback_days]:      # 用户没显式指定才覆盖
+        args.lookback = [OPTIMIZED_PRESET['lookback_days']]
+
+    print('[优化模式] 已切换到优化口径：')
+    print('  %d 只等权 / 仓位 %.0f%% / 择时盯持仓 / 回看 %s 天 / 涨停按开盘价拦截'
+          % (args.max_positions, args.position_ratio * 100, args.lookback))
+    print('  依据：实测 μ=+0.38%/天、σ=8.2%/天，波动损耗 σ²/2 吃掉算术收益的 90%，')
+    print('        凯利最优仓位 k*≈0.56，这里取更保守的 %.2f' % args.position_ratio)
+
+
 def run_label(args, cfg: StrategyConfig) -> str:
     """
     回测结果目录名：起止日期 + 回看天数，非默认的关键参数再追加短标签，
@@ -140,6 +172,16 @@ def run_label(args, cfg: StrategyConfig) -> str:
         parts.append(f'dd{cfg.decline_days_to_sell}')
     if cfg.stop_loss_ratio != default.stop_loss_ratio:
         parts.append('sl%g' % round(abs(cfg.stop_loss_ratio) * 100, 4))
+    if getattr(args, 'optimized', False):
+        parts.append('opt')
+    if cfg.max_positions != default.max_positions:
+        parts.append(f'n{cfg.max_positions}')
+    if cfg.position_ratio != default.position_ratio:
+        parts.append('pos%g' % round(cfg.position_ratio * 100, 4))
+    if cfg.timing_on_holdings:
+        parts.append('hold')
+    if cfg.limit_up_block_field != default.limit_up_block_field:
+        parts.append('up' + cfg.limit_up_block_field)
     if getattr(args, 'replicate_qmt', False):
         parts.append('qmt')
     if not cfg.filter_market_cap:
@@ -205,6 +247,10 @@ def main(argv=None) -> int:
                           try_download=args.download)
         return 0 if ok else 1
 
+    if args.optimized and args.replicate_qmt:
+        raise SystemExit('--optimized 与 --replicate-qmt 互斥，两者口径相反')
+    if args.optimized:
+        apply_optimized_preset(args)
     if args.replicate_qmt:
         apply_qmt_preset(args)
 
@@ -234,6 +280,10 @@ def main(argv=None) -> int:
                 limit_down_ratio=args.limit_down_ratio,
                 allow_sell_suspended=args.allow_sell_suspended,
                 skip_warmup_bars=args.skip_warmup,
+                max_positions=args.max_positions,
+                position_ratio=args.position_ratio,
+                timing_on_holdings=args.timing_on_holdings,
+                limit_up_block_field=args.limit_up_check,
             ),
             account=AccountConfig(
                 init_cash=args.cash,
@@ -278,6 +328,7 @@ def main(argv=None) -> int:
                     'engine': args.engine,
                     'dividend_type': args.dividend_type,
                     'replicate_qmt': args.replicate_qmt,
+                    'optimized': args.optimized,
                     'elapsed_seconds': round(elapsed, 2),
                     'sectors': list(sectors),
                     'strategy': asdict(config.strategy),

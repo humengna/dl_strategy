@@ -47,11 +47,20 @@ def rank_by_momentum(source: DataSource, pool: Sequence[str], date: str,
 def pick_target(source: DataSource, pool: Sequence[str], date: str,
                 cfg: StrategyConfig) -> Optional[str]:
     """取动量分数第 1 名"""
+    picks = pick_targets(source, pool, date, cfg, 1)
+    return picks[0] if picks else None
+
+
+def pick_targets(source: DataSource, pool: Sequence[str], date: str,
+                 cfg: StrategyConfig, count: Optional[int] = None) -> List[str]:
+    """取动量分数前 count 名（默认 cfg.max_positions）"""
+    count = cfg.max_positions if count is None else count
     ranked = rank_by_momentum(source, pool, date, cfg)
     if not ranked:
-        return None
-    log.info('Top3: %s', [(s, round(sc, 4)) for s, sc in ranked[:3]])
-    return ranked[0][0]
+        return []
+    log.info('Top%d: %s', min(3, len(ranked)),
+             [(s, round(sc, 4)) for s, sc in ranked[:3]])
+    return [s for s, _ in ranked[:max(count, 1)]]
 
 
 def momentum_series(source: DataSource, stock: str, date: str,
@@ -174,3 +183,19 @@ def price_and_limits(source: DataSource, stock: str, date: str):
             round(pre_close * (1 + ratio), 2),
             round(pre_close * (1 - ratio), 2),
             low_price)
+
+
+def blocked_by_limit_up(cfg: StrategyConfig, open_price: float,
+                        low_price: float, limit_up: float) -> bool:
+    """
+    是否因涨停买不进。
+
+    cfg.limit_up_block_field='low' 是原脚本口径：用当日最低价判断，
+    因 low <= open 恒成立，它实际只拦住「全天封板」，放过了
+    「开盘涨停、盘中打开」的票 —— 而那些票开盘同样买不到，属于未来函数。
+    'open' 用开盘价判断，是开盘时点就已知的信息。
+    """
+    if limit_up <= 0:
+        return False
+    price = low_price if cfg.limit_up_block_field == 'low' else open_price
+    return price >= limit_up

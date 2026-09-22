@@ -98,9 +98,10 @@ class SimAccount:
                 + amount * self.cfg.transfer_fee_rate
                 + amount * self.cfg.stamp_tax_rate)
 
-    def affordable_volume(self, price: float) -> int:
+    def affordable_volume(self, price: float, budget: Optional[float] = None) -> int:
         """
-        按可用资金算出能买的最大整手数量。
+        按可用资金算出能买的最大整手数量。budget 给定时再受该预算限制
+        （多标的等权时用来给每个仓位分配额度）。
 
         先用比例费用估一个上界，再逐手回退到「成交额 + 实际费用 <= 可用资金」，
         这样最低佣金（小额下单时费用远高于比例值）也能被正确预留。
@@ -108,17 +109,18 @@ class SimAccount:
         if price <= 0:
             return 0
 
+        limit = self.cash if budget is None else min(self.cash, max(budget, 0.0))
         lot = self.cfg.lot_size
         if not self.cfg.reserve_fee_on_buy:
             # 原脚本口径：不预留费用，直接按可用资金整除
-            return int(self.cash / price / lot) * lot
+            return int(limit / price / lot) * lot
 
-        raw = self.cash / (price * (1 + self.cfg.buy_cost_rate))
+        raw = limit / (price * (1 + self.cfg.buy_cost_rate))
         volume = int(raw / lot) * lot
 
         while volume >= lot:
             amount = price * volume
-            if amount + self.buy_fee(amount) <= self.cash + 1e-6:
+            if amount + self.buy_fee(amount) <= limit + 1e-6:
                 return volume
             volume -= lot
         return 0
