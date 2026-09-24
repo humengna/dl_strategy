@@ -142,6 +142,36 @@ python run_backtest.py --source csv --data-dir data/sample --start 20240102 --en
 [数据] 下载 [#########---------------]  40.0% 2090/5224 已用 03:12 剩余 04:47 600519.SH
 ```
 
+只看每日动量分数排行榜（不回测、不套任何过滤模块）：
+
+```bash
+python run_backtest.py --start 20240101 --end 20241231 --top-scores        # 默认前 5 名
+python run_backtest.py --start 20240101 --end 20241231 --top-scores 10     # 前 10 名
+python run_backtest.py --start 20240101 --end 20241231 --top-scores --scores-days 20
+python run_backtest.py --start 20240101 --end 20241231 --top-scores --lookback 5 29
+```
+
+```
+===========================================================
+[每日动量分数 TOP5]  回看 5 天 · 不套任何过滤模块
+  股票池=板块全部成分股，不看市值/ST/停牌/涨跌停
+  分数只用到上一交易日为止的收盘价，不含未来函数
+===========================================================
+  日期         排名 代码        名称               动量分数
+  20240401        1 301618.SZ   长联科技           1.2345e+04
+                  2 688981.SH   中芯国际              83.1957
+  ...
+```
+
+榜单同时写到 `results/scores_<起止日期>_lb<N>_top<M>.csv`（列：date, rank, stock,
+name, score），`--scores-csv` 改路径，`--no-save` 只打印不落盘，`--scores-days N`
+限制终端打印的天数（csv 始终是全量）。
+
+排行榜和回测共用同一套 `momentum_score_matrix`，面板提前量也对齐，
+所以分数和回测内部逐格完全相同 —— 差别只在于榜单前面没有任何过滤：
+市值、ST、停牌、涨跌停、择时一概不看，分数算得出来就上榜。
+用它可以看到「策略本来想买什么」，再和 `deals.csv` 里实际买到的对照。
+
 数据自检（取不到数据时先跑这个）：
 
 ```bash
@@ -164,7 +194,8 @@ python run_backtest.py --check-data --download   # 顺便试下载一只标的
 `--no-rsrs` 跳过 RSRS、`--no-cap-filter` 关闭市值过滤、`--dividend-type` 复权方式、
 `--no-cache` 关闭行情内存缓存、
 `--engine loop` 切回逐日引擎、
-`--out-dir` 指定结果目录、`--no-save` 不保存结果、`-q` 只输出进度条和最终统计，
+`--out-dir` 指定结果目录、`--no-save` 不保存结果、`-q` 只输出进度条和最终统计、
+`--top-scores [N]` 只出动量分数排行榜不回测（配 `--scores-csv` / `--scores-days`），
 以及上面那四个费率参数。
 
 ## 项目结构
@@ -180,7 +211,8 @@ momentum_strategy/
 │   ├── timing.py       # 步骤 5：择时信号、RSRS
 │   ├── broker.py       # 模拟账户：T+1、佣金、印花税、成交流水
 │   ├── engine.py       # 回测引擎：交易日循环、调仓、止损、复盘
-│   ├── report.py       # 绩效统计与 csv 输出
+│   ├── report.py       # 绩效统计、终端表格对齐与 csv 输出
+│   ├── scoreboard.py   # 每日动量分数排行榜（不套过滤模块）
 │   ├── panel.py        # 向量化行情面板与滚动回归核
 │   ├── vector_engine.py# 向量化回测引擎（默认）
 │   ├── sample_data.py  # 合成样例行情
@@ -203,12 +235,13 @@ momentum_strategy/
 python -m pytest
 ```
 
-204 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
+226 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
 「当日 K 线不参与打分」的未来函数检查）、股票池过滤、择时信号、T+1 与费用、
 调仓与止损、绩效统计，以及 xtdata 取数行为（分批、字段退回、无数据报错，
 用桩 xtquant 注入，不需要 QMT）、进度条渲染、
 向量化指标与 polyfit 的数值一致性、两个引擎的逐笔结果一致性、结果文件落盘，
-以及命令行的结果目录命名与多组参数回测。
+以及命令行的结果目录命名与多组参数回测，
+还有动量分数排行榜（与回测分数逐格一致、不受任何过滤影响、无未来函数）。
 
 ## 复权
 

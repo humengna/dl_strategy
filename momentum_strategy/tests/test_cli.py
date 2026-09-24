@@ -186,3 +186,50 @@ def test_dividend_type_recorded_in_summary(sample_dir, tmp_path):
 
     with open(out / 'summary.json', encoding='utf-8') as f:
         assert json.load(f)['dividend_type'] == 'back'
+
+
+# ---------------- 每日动量分数排行榜 ----------------
+
+def test_top_scores_默认取前五(tmp_path):
+    from momentum.cli import build_parser
+    assert build_parser().parse_args([]).top_scores == 0
+    assert build_parser().parse_args(['--top-scores']).top_scores == 5
+    assert build_parser().parse_args(['--top-scores', '10']).top_scores == 10
+
+
+def test_top_scores_输出榜单且不跑回测(tmp_path, capsys):
+    data_dir = write_sample_dir(str(tmp_path / 'data'), days=120, start='20240102')
+    out = tmp_path / 'out'
+    assert main(['--source', 'csv', '--data-dir', data_dir,
+                 '--start', '20240401', '--end', '20240430',
+                 '--top-scores', '3', '--out-dir', str(out), '-q']) == 0
+
+    text = capsys.readouterr().out
+    assert 'TOP3' in text
+    assert '总收益' not in text                      # 没有跑回测
+
+    files = os.listdir(out)
+    assert files == ['scores_20240401_20240430_lb5_top3.csv']
+    rows = open(out / files[0], encoding='utf-8-sig').read().splitlines()
+    assert rows[0] == 'date,rank,stock,name,score'
+    assert len(rows) > 1
+
+
+def test_top_scores_多组回看天数各出一份(tmp_path):
+    data_dir = write_sample_dir(str(tmp_path / 'data'), days=160, start='20240102')
+    out = tmp_path / 'out'
+    main(['--source', 'csv', '--data-dir', data_dir,
+          '--start', '20240601', '--end', '20240630', '--top-scores',
+          '--lookback', '5', '29', '--out-dir', str(out), '-q'])
+    assert sorted(os.listdir(out)) == ['scores_20240601_20240630_lb29_top5.csv',
+                                       'scores_20240601_20240630_lb5_top5.csv']
+
+
+def test_top_scores_可以不落盘(tmp_path, capsys):
+    data_dir = write_sample_dir(str(tmp_path / 'data'), days=120, start='20240102')
+    out = tmp_path / 'out'
+    main(['--source', 'csv', '--data-dir', data_dir,
+          '--start', '20240401', '--end', '20240410',
+          '--top-scores', '--out-dir', str(out), '--no-save', '-q'])
+    assert not out.exists()
+    assert 'TOP5' in capsys.readouterr().out

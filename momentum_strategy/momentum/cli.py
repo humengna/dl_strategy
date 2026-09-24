@@ -6,7 +6,6 @@ import logging
 import os
 import sys
 import time
-import unicodedata
 from dataclasses import asdict
 from datetime import datetime
 
@@ -14,7 +13,9 @@ from .config import (CONCEPT_SECTORS_DEFAULT, OPTIMIZED_PRESET, AccountConfig,
                      BacktestConfig, StrategyConfig)
 from .datasource import DEFAULT_DIVIDEND_TYPE, DIVIDEND_TYPES
 from .engine import BacktestEngine
-from .report import evaluate, format_report, save_csv, save_results
+from .report import (display_width, evaluate, format_report, pad,
+                     save_csv, save_results)
+from .scoreboard import DEFAULT_TOP_N, run_scoreboard
 from .vector_engine import VectorBacktestEngine
 
 
@@ -93,6 +94,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help='过户费费率，双边，默认 1e-5（千分之 0.01）')
     p.add_argument('--stamp-tax', type=float, default=AccountConfig.stamp_tax_rate,
                    help='印花税费率，仅卖出，默认 5e-4（千分之 0.5）')
+
+    p.add_argument('--top-scores', type=int, nargs='?', const=DEFAULT_TOP_N, default=0,
+                   metavar='N',
+                   help='只打印每日动量分数前 N 名（不带数字时为 %d）然后退出：'
+                        '不做回测、不套任何过滤模块（市值/ST/停牌/涨跌停一律不看）'
+                        % DEFAULT_TOP_N)
+    p.add_argument('--scores-csv', default='',
+                   help='排行榜输出路径，默认 results/scores_<起止日期>_lb<N>_top<M>.csv')
+    p.add_argument('--scores-days', type=int, default=0,
+                   help='终端最多打印最后多少个交易日的排行，0=全部打印（csv 始终是全量）')
 
     p.add_argument('--engine', choices=['fast', 'loop'], default='fast',
                    help='fast=向量化引擎（默认）；loop=逐日引擎，慢很多，用于交叉验证')
@@ -204,16 +215,6 @@ def suffix_path(path: str, tag: str) -> str:
     return f'{base}_{tag}{ext}'
 
 
-def display_width(text: str) -> int:
-    """中日韩字符在终端里占两列，按显示宽度算才能对齐"""
-    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in str(text))
-
-
-def pad(text: str, width: int, left: bool = False) -> str:
-    space = ' ' * max(0, width - display_width(text))
-    return (text + space) if left else (space + text)
-
-
 COMPARE_COLUMNS = (('回看天数', 10, True), ('期末资产', 13, False), ('总收益', 10, False),
                    ('年化', 10, False), ('最大回撤', 10, False), ('夏普', 7, False),
                    ('交易笔数', 9, False), ('卖出胜率', 9, False))
@@ -237,6 +238,40 @@ def compare_table(rows) -> str:
     return '\n'.join(lines)
 
 
+def scoreboard_path(args, lookback: int, multi: bool) -> str:
+    """排行榜 csv 路径。--no-save 时只打印不落盘。"""
+    if args.no_save:
+        return ''
+    if args.scores_csv:
+        return suffix_path(args.scores_csv, f'lb{lookback}' if multi else '')
+    name = f'scores_{args.start}_{args.end}_lb{lookback}_top{args.top_scores}.csv'
+    return os.path.join(args.out_dir or 'results', name)
+
+
+def run_scoreboards(args, sectors, lookbacks) -> int:
+    """--top-scores：只算分数排行，不进回测"""
+    multi = len(lookbacks) > 1
+    for n, lookback in enumerate(lookbacks, 1):
+        if multi:
+            print('\n' + '=' * 78)
+            print(f'[排行榜 {n}/{len(lookbacks)}] 回看 {lookback} 天')
+            print('=' * 78)
+
+        config = BacktestConfig(
+            start_date=args.start,
+            end_date=args.end,
+            strategy=StrategyConfig(concept_sectors=sectors, lookback_days=lookback),
+        )
+        run_scoreboard(
+            build_source(args), config,
+            top_n=args.top_scores,
+            out_path=scoreboard_path(args, lookback, multi),
+            download=args.download and n == 1,
+            max_print_days=args.scores_days,
+        )
+    return 0
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(not args.quiet)
@@ -258,6 +293,10 @@ def main(argv=None) -> int:
         or CONCEPT_SECTORS_DEFAULT
 
     lookbacks = list(dict.fromkeys(args.lookback))
+
+    if args.top_scores:
+        return run_scoreboards(args, sectors, lookbacks)
+
     multi = len(lookbacks) > 1
     engine_cls = VectorBacktestEngine if args.engine == 'fast' else BacktestEngine
     stamp = datetime.now().strftime('%H%M%S')

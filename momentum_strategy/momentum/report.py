@@ -4,6 +4,7 @@
 import json
 import math
 import os
+import unicodedata
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -268,3 +269,17 @@ def save_csv(result: BacktestResult, equity_path: str = '', deals_path: str = ''
     if deals_path:
         deals_dataframe(result).to_csv(deals_path, index=False, encoding='utf-8-sig')
         print(f'[输出] 成交明细: {deals_path}')
+
+
+# ============================================================
+# 终端表格对齐
+# ============================================================
+
+def display_width(text: str) -> int:
+    """中日韩字符在终端里占两列，按显示宽度算才能对齐"""
+    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in str(text))
+
+
+def pad(text: str, width: int, left: bool = False) -> str:
+    space = ' ' * max(0, width - display_width(text))
+    return (text + space) if left else (space + text)
