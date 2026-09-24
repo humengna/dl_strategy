@@ -24,7 +24,7 @@ OPTIMIZED_OUT = os.path.join(os.path.dirname(HERE), 'dl_strategy_opt.py')
 MODULES = [
     'progress', 'config', 'indicators', 'panel', 'broker', 'datasource',
     'universe', 'selector', 'timing', 'engine', 'vector_engine', 'report',
-    'scoreboard', 'sample_data', 'diagnostics', 'cli',
+    'scoreboard', 'score_returns', 'sample_data', 'diagnostics', 'cli',
 ]
 
 # 允许重复出现的模块级名字（值相同，合并后无副作用）

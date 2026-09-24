@@ -30,6 +30,7 @@ python dl_strategy_xtdata.py --start 20240101 --end 20241231 --download   # 先�
 python dl_strategy_xtdata.py --start 20240101 --end 20241231 --save-csv equity.csv
 python dl_strategy_xtdata.py --start 20240101 --end 20241231 --no-cache   # 关闭内存缓存
 python dl_strategy_xtdata.py --start 20240101 --end 20241231 --top-scores # 只打印每日动量分数前 5 名
+python dl_strategy_xtdata.py --eval-scores results/scores_xxx.csv        # 榜单：次日开盘买入、第二天开盘卖出
 ```
 
 ## 策略流程（每个交易日）
@@ -46,7 +47,7 @@ python dl_strategy_xtdata.py --start 20240101 --end 20241231 --top-scores # 只�
 ```bash
 cd momentum_strategy
 pip install -r requirements-dev.txt
-python -m pytest                                      # 226 个用例，不需要 QMT
+python -m pytest                                      # 252 个用例，不需要 QMT
 
 # 离线试跑（任何平台）
 python tools/make_sample_data.py --out data/sample --days 700

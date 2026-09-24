@@ -233,3 +233,48 @@ def test_top_scores_可以不落盘(tmp_path, capsys):
           '--top-scores', '--out-dir', str(out), '--no-save', '-q'])
     assert not out.exists()
     assert 'TOP5' in capsys.readouterr().out
+
+
+# ---------------- 榜单收益评估 ----------------
+
+def test_eval_scores_算收益并落两份文件(tmp_path, capsys):
+    data_dir = write_sample_dir(str(tmp_path / 'data'), days=300, start='20230103')
+    out = tmp_path / 'out'
+    main(['--source', 'csv', '--data-dir', data_dir,
+          '--start', '20240102', '--end', '20240331',
+          '--top-scores', '3', '--out-dir', str(out), '-q'])
+    board = str(out / os.listdir(out)[0])
+
+    assert main(['--source', 'csv', '--data-dir', data_dir,
+                 '--eval-scores', board, '-q']) == 0
+
+    text = capsys.readouterr().out
+    assert '次日开盘买入 / 第二天开盘卖出' in text
+    assert 'TOP3 等权' in text
+
+    base = board[:-4]
+    detail = base + '_returns_d1h1.csv'
+    assert os.path.exists(detail) and os.path.exists(base + '_returns_d1h1_equity.csv')
+    head = open(detail, encoding='utf-8-sig').readline().strip()
+    assert head == 'date,rank,stock,name,score,buy_date,buy_open,sell_date,sell_open,ret,ret_net,note'
+
+
+def test_eval_scores_买卖口径写进文件名(tmp_path):
+    from momentum.cli import build_parser, eval_out_path
+    args = build_parser().parse_args(['--eval-scores', 'a/b/scores.csv',
+                                      '--entry-delay', '2', '--hold-days', '5'])
+    assert eval_out_path(args) == os.path.join('a', 'b', 'scores_returns_d2h5.csv')
+
+
+def test_eval_scores_只看第一名(tmp_path, capsys):
+    data_dir = write_sample_dir(str(tmp_path / 'data'), days=300, start='20230103')
+    out = tmp_path / 'out'
+    main(['--source', 'csv', '--data-dir', data_dir,
+          '--start', '20240102', '--end', '20240331',
+          '--top-scores', '3', '--out-dir', str(out), '-q'])
+    board = str(out / [f for f in os.listdir(out) if f.startswith('scores_')][0])
+
+    main(['--source', 'csv', '--data-dir', data_dir, '--eval-scores', board,
+          '--eval-ranks', '1', '--no-save', '-q'])
+    text = capsys.readouterr().out
+    assert '第 1 名' in text and '第 2 名' not in text

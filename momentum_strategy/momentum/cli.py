@@ -15,6 +15,7 @@ from .datasource import DEFAULT_DIVIDEND_TYPE, DIVIDEND_TYPES
 from .engine import BacktestEngine
 from .report import (display_width, evaluate, format_report, pad,
                      save_csv, save_results)
+from .score_returns import run_score_returns
 from .scoreboard import DEFAULT_TOP_N, run_scoreboard
 from .vector_engine import VectorBacktestEngine
 
@@ -104,6 +105,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help='排行榜输出路径，默认 results/scores_<起止日期>_lb<N>_top<M>.csv')
     p.add_argument('--scores-days', type=int, default=0,
                    help='终端最多打印最后多少个交易日的排行，0=全部打印（csv 始终是全量）')
+
+    p.add_argument('--eval-scores', default='', metavar='CSV',
+                   help='读入排行榜 csv，算「次日开盘买入、第二天开盘卖出」的收益并退出。'
+                        '买卖都取开盘价，逐日首尾相接，可直接连乘成净值')
+    p.add_argument('--entry-delay', type=int, default=1, metavar='N',
+                   help='--eval-scores：信号日之后第 N 个交易日开盘买入，默认 1（次日）')
+    p.add_argument('--hold-days', type=int, default=1, metavar='N',
+                   help='--eval-scores：买入后持有 N 个交易日，在那天开盘卖出，默认 1')
+    p.add_argument('--eval-ranks', type=int, nargs='+', default=[], metavar='K',
+                   help='--eval-scores：只评估这些名次，默认全部')
+    p.add_argument('--eval-out', default='',
+                   help='--eval-scores：逐笔明细输出路径，默认榜单同目录 <榜单名>_returns.csv')
 
     p.add_argument('--engine', choices=['fast', 'loop'], default='fast',
                    help='fast=向量化引擎（默认）；loop=逐日引擎，慢很多，用于交叉验证')
@@ -272,6 +285,35 @@ def run_scoreboards(args, sectors, lookbacks) -> int:
     return 0
 
 
+def eval_out_path(args) -> str:
+    """逐笔明细默认落在榜单旁边，文件名带上买卖口径，不同参数不互相覆盖"""
+    if args.no_save:
+        return ''
+    if args.eval_out:
+        return args.eval_out
+    base, ext = os.path.splitext(args.eval_scores)
+    return f'{base}_returns_d{args.entry_delay}h{args.hold_days}{ext or ".csv"}'
+
+
+def run_score_eval(args) -> int:
+    """--eval-scores：按榜单算「次日开盘买入、第二天开盘卖出」的收益"""
+    run_score_returns(
+        build_source(args), args.eval_scores,
+        delay=args.entry_delay,
+        hold=args.hold_days,
+        account=AccountConfig(
+            commission_rate=args.commission,
+            min_commission=args.min_commission,
+            transfer_fee_rate=args.transfer_fee,
+            stamp_tax_rate=args.stamp_tax,
+        ),
+        ranks=args.eval_ranks,
+        out_path=eval_out_path(args),
+        download=args.download,
+    )
+    return 0
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(not args.quiet)
@@ -293,6 +335,9 @@ def main(argv=None) -> int:
         or CONCEPT_SECTORS_DEFAULT
 
     lookbacks = list(dict.fromkeys(args.lookback))
+
+    if args.eval_scores:
+        return run_score_eval(args)
 
     if args.top_scores:
         return run_scoreboards(args, sectors, lookbacks)
