@@ -176,6 +176,7 @@ name, score），`--scores-csv` 改路径，`--no-save` 只打印不落盘，`--
 
 ```bash
 python run_backtest.py --eval-scores results/scores_20240101_20241231_lb5_top5.csv
+python run_backtest.py --eval-scores <榜单.csv> --eval-ranks 1 --skip-limit-up
 python run_backtest.py --eval-scores <榜单.csv> --eval-ranks 1        # 只看第 1 名
 python run_backtest.py --eval-scores <榜单.csv> --hold-days 5         # 改成持有 5 天
 python run_backtest.py --eval-scores <榜单.csv> --entry-delay 0       # 信号日当天开盘就买
@@ -195,6 +196,17 @@ python run_backtest.py --eval-scores <榜单.csv> --entry-delay 0       # 信号
 D+1 开盘，`--hold-days 1` 在 D+2 开盘卖出。同一名次逐日首尾相接（今天的卖出价
 就是明天的买入价），所以每日收益连乘就是一条净值曲线，中间没有重叠持仓。
 停牌的处理：买入日停牌这笔作废，卖出日停牌顺延到复牌当天，两种都在明细里标注。
+
+`--skip-limit-up` 剔除买入日开盘就涨停的信号（挂单买不进）。判定用涨幅比例而不是
+`round(前收×(1+幅度), 2)` —— 后复权价不是真实报价，对它取两位小数没有意义；
+`--limit-tolerance` 默认 0.003 吸收复权与取整误差，代价是涨 9.7%~10% 没封板的票
+也会被当成买不进，偏保守。涨停幅度按 主板 10% / 创业板·科创板 20% /
+主板 ST 5% / 北交所 30% 区分，ST 用的是榜单里的名称。
+
+买不进的那天记 **持币 0%**，不是从曲线里抹掉 —— 统计表里「笔数」那列是
+`成交/信号日`，日均、中位数、胜率、最好最差只统计成交的那些笔，
+累计、年化、最大回撤、夏普按含持币日的完整曲线算。TOP-N 等权同理：
+买不进的那个仓位当天空着，组合收益是「当天成交的收益之和 ÷ 名次数」。
 
 输出两个文件：`<榜单名>_returns_d1h1.csv`（逐笔明细，含买卖日期与开盘价）和
 `..._equity.csv`（TOP-N 等权组合的逐日收益与净值）。两张表分别按不计费用和
@@ -225,7 +237,8 @@ python run_backtest.py --check-data --download   # 顺便试下载一只标的
 `--engine loop` 切回逐日引擎、
 `--out-dir` 指定结果目录、`--no-save` 不保存结果、`-q` 只输出进度条和最终统计、
 `--top-scores [N]` 只出动量分数排行榜不回测（配 `--scores-csv` / `--scores-days`）、
-`--eval-scores` 按榜单算持有收益（配 `--entry-delay` / `--hold-days` / `--eval-ranks`），
+`--eval-scores` 按榜单算持有收益（配 `--entry-delay` / `--hold-days` / `--eval-ranks` /
+`--skip-limit-up` / `--limit-tolerance`），
 以及上面那四个费率参数。
 
 ## 项目结构
@@ -266,14 +279,14 @@ momentum_strategy/
 python -m pytest
 ```
 
-252 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
+262 个用例，全部基于合成数据，不需要 QMT 环境。覆盖指标计算、打分排序（含
 「当日 K 线不参与打分」的未来函数检查）、股票池过滤、择时信号、T+1 与费用、
 调仓与止损、绩效统计，以及 xtdata 取数行为（分批、字段退回、无数据报错，
 用桩 xtquant 注入，不需要 QMT）、进度条渲染、
 向量化指标与 polyfit 的数值一致性、两个引擎的逐笔结果一致性、结果文件落盘，
 以及命令行的结果目录命名与多组参数回测，
 还有动量分数排行榜（与回测分数逐格一致、不受任何过滤影响、无未来函数）
-和榜单收益评估（取价口径、首尾相接、费用、停牌顺延）。
+和榜单收益评估（取价口径、首尾相接、费用、停牌顺延、涨停剔除与持币计入）。
 
 ## 复权
 

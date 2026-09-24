@@ -11,7 +11,8 @@ from momentum.config import AccountConfig
 from momentum.datasource import CsvDataSource
 from momentum.panel import Panel
 from momentum.sample_data import make_calendar
-from momentum.score_returns import (NOTE_NO_BAR, NOTE_NO_BUY, NOTE_NO_SELL, TRADED, curve_stats,
+from momentum.score_returns import (NOTE_LIMIT_UP, NOTE_NO_BAR, NOTE_NO_BUY,
+                                    NOTE_NO_SELL, TRADED, curve_stats,
                                     portfolio_equity, load_scoreboard,
                                     pad_end_date, rank_stats, score_returns)
 
@@ -184,7 +185,13 @@ def test_curve_stats_回撤为负():
 
 def test_curve_stats_空序列():
     assert curve_stats([]) == {}
-    assert curve_stats([np.nan, np.nan]) == {}
+
+
+def test_curve_stats_全是买不进的日子算持币():
+    """买不进不是「跳过这天」而是「当天空仓」，净值走平而不是消失"""
+    stats = curve_stats([np.nan, np.nan])
+    assert stats['days'] == 2 and stats['traded'] == 0
+    assert stats['total'] == 0.0 and stats['max_drawdown'] == 0.0
 
 
 def test_rank_stats_每个名次一行加一行组合():
@@ -247,3 +254,102 @@ def test_pad_end_date_不超过今天():
     today = datetime.now().strftime('%Y%m%d')
     assert pad_end_date('20240102', 1, 1, 20) > '20240102'
     assert pad_end_date(today, 1, 1, 20) == today
+
+
+# ---------------- 剔除买入日开盘涨停 ----------------
+
+def limit_frame(opens, pre_closes):
+    opens, pre_closes = np.asarray(opens, float), np.asarray(pre_closes, float)
+    return pd.DataFrame({
+        'open': opens, 'close': opens, 'high': opens, 'low': opens,
+        'preClose': pre_closes,
+        'volume': np.where(np.isfinite(opens), 1e6, 0.0),
+        'suspendFlag': np.where(np.isfinite(opens), 0.0, 1.0),
+    }, index=list(DATES))
+
+
+def test_涨停幅度按板块与st区分():
+    from momentum.score_returns import limit_up_ratio
+    assert limit_up_ratio('600001.SH') == 0.10
+    assert limit_up_ratio('000001.SZ', '平安银行') == 0.10
+    assert limit_up_ratio('600053.SH', '*ST九鼎') == 0.05
+    assert limit_up_ratio('002211.SZ', 'ST宏达') == 0.05
+    assert limit_up_ratio('300093.SZ') == 0.20
+    assert limit_up_ratio('688981.SH') == 0.20
+    assert limit_up_ratio('300093.SZ', 'ST某某') == 0.20      # 创业板 ST 也是 20%
+    assert limit_up_ratio('830799.BJ') == 0.30
+
+
+def test_开盘一字涨停买不进():
+    pre = np.full(DAYS, 10.0)
+    opens = np.full(DAYS, 10.0)
+    opens[1] = 11.0                                   # 买入日开盘 +10%
+    panel = make_panel({'600001.SH': limit_frame(opens, pre)})
+
+    kept = score_returns(board([(DATES[0], 1, '600001.SH')]), panel)
+    assert kept.iloc[0]['note'] == TRADED             # 不开开关时照旧成交
+
+    skipped = score_returns(board([(DATES[0], 1, '600001.SH')]), panel, skip_limit_up=True)
+    assert skipped.iloc[0]['note'] == NOTE_LIMIT_UP
+    assert np.isnan(skipped.iloc[0]['ret'])
+    assert skipped.iloc[0]['buy_open'] == 11.0        # 明细里保留当时的开盘价
+
+
+def test_没到涨停不剔除():
+    pre = np.full(DAYS, 10.0)
+    opens = np.full(DAYS, 10.0)
+    opens[1] = 10.5                                   # +5%，主板没封板
+    panel = make_panel({'600001.SH': limit_frame(opens, pre)})
+    detail = score_returns(board([(DATES[0], 1, '600001.SH')]), panel, skip_limit_up=True)
+    assert detail.iloc[0]['note'] == TRADED
+
+
+def test_创业板_涨停线是20个点():
+    pre = np.full(DAYS, 10.0)
+    opens = np.full(DAYS, 10.0)
+    opens[1] = 11.0                                   # +10%，创业板还没封板
+    panel = make_panel({'300093.SZ': limit_frame(opens, pre)})
+    detail = score_returns(board([(DATES[0], 1, '300093.SZ')]), panel, skip_limit_up=True)
+    assert detail.iloc[0]['note'] == TRADED
+
+    opens[1] = 12.0                                   # +20%
+    panel = make_panel({'300093.SZ': limit_frame(opens, pre)})
+    detail = score_returns(board([(DATES[0], 1, '300093.SZ')]), panel, skip_limit_up=True)
+    assert detail.iloc[0]['note'] == NOTE_LIMIT_UP
+
+
+def test_st_涨停线是5个点():
+    pre = np.full(DAYS, 10.0)
+    opens = np.full(DAYS, 10.0)
+    opens[1] = 10.5
+    panel = make_panel({'600053.SH': limit_frame(opens, pre)})
+    rows = pd.DataFrame([{'date': DATES[0], 'rank': 1, 'stock': '600053.SH',
+                          'name': '*ST九鼎', 'score': 1.0}])
+    detail = score_returns(rows, panel, skip_limit_up=True)
+    assert detail.iloc[0]['note'] == NOTE_LIMIT_UP
+
+
+def test_容差可调():
+    pre = np.full(DAYS, 10.0)
+    opens = np.full(DAYS, 10.0)
+    opens[1] = 10.98                                  # +9.8%，差一点封板
+    panel = make_panel({'600001.SH': limit_frame(opens, pre)})
+    rows = board([(DATES[0], 1, '600001.SH')])
+    assert score_returns(rows, panel, skip_limit_up=True).iloc[0]['note'] == NOTE_LIMIT_UP
+    strict = score_returns(rows, panel, skip_limit_up=True, limit_tolerance=0.0)
+    assert strict.iloc[0]['note'] == TRADED
+
+
+def test_涨停日按持币计入曲线():
+    """买不进不是跳过这天，是当天空仓；净值要走平而不是接上后一天"""
+    pre = np.full(DAYS, 10.0)
+    opens = np.array([10.0, 11.0] + [10.0 * 1.01 ** i for i in range(DAYS - 2)])
+    panel = make_panel({'600001.SH': limit_frame(opens, pre)})
+    rows = board([(DATES[i], 1, '600001.SH') for i in range(4)])
+
+    detail = score_returns(rows, panel, skip_limit_up=True)
+    stats = rank_stats(detail)[0][1]
+    assert stats['days'] == 4 and stats['traded'] == 3
+    curve = portfolio_equity(detail)
+    assert curve['ret'].iloc[0] == 0.0                # 第一天买不进，记 0
+    assert len(curve) == 4

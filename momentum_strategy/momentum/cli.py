@@ -113,6 +113,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help='--eval-scores：信号日之后第 N 个交易日开盘买入，默认 1（次日）')
     p.add_argument('--hold-days', type=int, default=1, metavar='N',
                    help='--eval-scores：买入后持有 N 个交易日，在那天开盘卖出，默认 1')
+    p.add_argument('--skip-limit-up', action='store_true',
+                   help='--eval-scores：剔除买入日开盘就涨停的信号（挂单买不进），'
+                        '该日按持币计入曲线')
+    p.add_argument('--limit-tolerance', type=float, default=0.003, metavar='X',
+                   help='--eval-scores：涨停判定的容差，默认 0.003（10%% 的票按 9.7%% 算封板）')
     p.add_argument('--eval-ranks', type=int, nargs='+', default=[], metavar='K',
                    help='--eval-scores：只评估这些名次，默认全部')
     p.add_argument('--eval-out', default='',
@@ -292,7 +297,12 @@ def eval_out_path(args) -> str:
     if args.eval_out:
         return args.eval_out
     base, ext = os.path.splitext(args.eval_scores)
-    return f'{base}_returns_d{args.entry_delay}h{args.hold_days}{ext or ".csv"}'
+    tag = f'd{args.entry_delay}h{args.hold_days}'
+    if args.eval_ranks:
+        tag += 'r' + ''.join(str(r) for r in sorted(args.eval_ranks))
+    if args.skip_limit_up:
+        tag += '_noup'
+    return f'{base}_returns_{tag}{ext or ".csv"}'
 
 
 def run_score_eval(args) -> int:
@@ -310,6 +320,8 @@ def run_score_eval(args) -> int:
         ranks=args.eval_ranks,
         out_path=eval_out_path(args),
         download=args.download,
+        skip_limit_up=args.skip_limit_up,
+        limit_tolerance=args.limit_tolerance,
     )
     return 0
 

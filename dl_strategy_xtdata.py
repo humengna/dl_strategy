@@ -3047,6 +3047,7 @@ TRADED = ''
 NOTE_NO_BUY = '买入日停牌'
 NOTE_NO_SELL = '卖出日之后无行情'
 NOTE_NO_BAR = '无行情数据'
+NOTE_LIMIT_UP = '买入日开盘涨停'
 
 
 # ============================================================
@@ -3080,7 +3081,7 @@ def build_open_panel(source: DataSource, stocks: Sequence[str],
     source.preload(stocks, start_date, end_date)
 
     panel = Panel.from_source(source, stocks, start_date, end_date,
-                              fields=('open', 'close', 'volume', 'suspendFlag'))
+                              fields=('open', 'close', 'preClose', 'volume', 'suspendFlag'))
     if not len(panel) or not panel.stocks:
         raise SystemExit('取不到任何日线数据，无法计算收益。'
                          '加 --download 补下载，或用 --check-data 定位')
@@ -3107,20 +3108,67 @@ def _first_valid(opens: np.ndarray, j: int, col: int, limit: int) -> int:
     return -1
 
 
+def limit_up_ratio(stock: str, name: str = '') -> float:
+    """
+    涨停幅度。创业板/科创板 20%（ST 也是 20%），北交所 30%，
+    主板 ST/*ST 5%，其余 10%。indicators.limit_ratio 只按代码前缀分，
+    这里多用榜单里的名称补上 ST 一档。
+    """
+    code = stock.split('.')[0]
+    if code.startswith(('43', '83', '87', '88', '92')):
+        return 0.30
+    if code.startswith(('300', '301', '688')):
+        return 0.20
+    if 'ST' in (name or '').upper().replace(' ', ''):
+        return 0.05
+    return limit_ratio(stock)
+
+
+def is_limit_up_open(open_price: float, pre_close: float, ratio: float,
+                     tolerance: float = 0.003) -> bool:
+    """
+    开盘价是否已经涨停。
+
+    用涨幅比例判断而不是 round(前收×(1+幅度), 2)：后复权价不是真实报价，
+    对它做两位小数取整没有意义。tolerance 吸收复权与取整带来的零点几个点误差
+    —— 代价是涨 9.7%~10% 没封板的票也会被当成买不进，属于偏保守。
+    """
+    if not (np.isfinite(open_price) and np.isfinite(pre_close)) or pre_close <= 0:
+        return False
+    return open_price / pre_close - 1.0 >= ratio - tolerance
+
+
+def _prev_close(pre_closes, closes, i: int, col: int) -> float:
+    """前收盘价：优先取 preClose 字段，缺失时回落到上一行的收盘价"""
+    if pre_closes is not None:
+        value = pre_closes[i, col]
+        if np.isfinite(value) and value > 0:
+            return float(value)
+    if closes is not None and i > 0:
+        value = closes[i - 1, col]
+        if np.isfinite(value) and value > 0:
+            return float(value)
+    return float('nan')
+
+
 def score_returns(board: pd.DataFrame, panel: Panel, delay: int = 1, hold: int = 1,
-                  account: Optional[AccountConfig] = None,
-                  max_sell_delay: int = 20) -> pd.DataFrame:
+                  account: Optional[AccountConfig] = None, max_sell_delay: int = 20,
+                  skip_limit_up: bool = False, limit_tolerance: float = 0.003
+                  ) -> pd.DataFrame:
     """
     逐条信号算收益，返回明细表。
 
-    delay: 信号日之后第几个交易日开盘买入（1 = 次日）
-    hold : 买入后持有几个交易日，在那天开盘卖出（1 = 第二天）
+    delay          : 信号日之后第几个交易日开盘买入（1 = 次日）
+    hold           : 买入后持有几个交易日，在那天开盘卖出（1 = 第二天）
+    skip_limit_up  : 买入日开盘已涨停的剔除（挂单买不进），这笔记为持币
     """
     account = account or AccountConfig()
     buy_rate = account.buy_cost_rate
     sell_rate = account.sell_cost_rate
 
     opens = panel.field('open')
+    closes = panel.field('close')
+    pre_closes = panel.field('preClose')
     dates = panel.dates
     records = []
 
@@ -3139,6 +3187,14 @@ def score_returns(board: pd.DataFrame, panel: Panel, delay: int = 1, hold: int =
         if b < 0 or not (np.isfinite(opens[b, col]) and opens[b, col] > 0):
             records.append(dict(base, note=NOTE_NO_BUY))       # 买入日停牌，这笔作废
             continue
+
+        if skip_limit_up:
+            prev = _prev_close(pre_closes, closes, b, col)
+            ratio = limit_up_ratio(row.stock, getattr(row, 'name', ''))
+            if is_limit_up_open(opens[b, col], prev, ratio, limit_tolerance):
+                records.append(dict(base, buy_date=dates[b], buy_open=float(opens[b, col]),
+                                    note=NOTE_LIMIT_UP))
+                continue
 
         s = _first_valid(opens, b + hold, col, max_sell_delay)   # 卖出遇停牌顺延
         if s < 0:
@@ -3160,11 +3216,19 @@ def score_returns(board: pd.DataFrame, panel: Panel, delay: int = 1, hold: int =
 # 统计
 # ============================================================
 
-def curve_stats(returns: Sequence[float], trading_days_per_year: int = 244) -> Dict[str, float]:
-    """一条逐日收益序列的累计 / 年化 / 回撤 / 夏普"""
-    values = np.array([r for r in returns if np.isfinite(r)], dtype=float)
+def curve_stats(series: Sequence[float], trades: Optional[Sequence[float]] = None,
+                trading_days_per_year: int = 244) -> Dict[str, float]:
+    """
+    series: 逐信号日的收益，买不进/卖不掉的那天记 0（持币），用来算净值曲线
+    trades: 实际成交的那些笔，用来算日均 / 中位数 / 胜率 / 最好最差
+            —— 不传就等同于 series 里的非零项
+    """
+    values = np.asarray([0.0 if not np.isfinite(r) else float(r) for r in series], dtype=float)
     if len(values) == 0:
         return {}
+
+    done = np.asarray([float(r) for r in (trades if trades is not None else series)
+                       if np.isfinite(r)], dtype=float)
 
     equity = np.cumprod(1.0 + values)
     peak = np.maximum.accumulate(equity)
@@ -3172,40 +3236,58 @@ def curve_stats(returns: Sequence[float], trading_days_per_year: int = 244) -> D
     total = float(equity[-1] - 1.0)
 
     years = len(values) / float(trading_days_per_year)
-    if years > 0 and equity[-1] > 0:
-        annual = float(equity[-1] ** (1.0 / years) - 1.0)
+    annual = float(equity[-1] ** (1.0 / years) - 1.0) if years > 0 and equity[-1] > 0 else float('nan')
+
+    std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+    sharpe = (float(values.mean()) / std * math.sqrt(trading_days_per_year)) if std > 0 else float('nan')
+
+    stats = {'days': len(values), 'traded': len(done), 'total': total, 'annual': annual,
+             'max_drawdown': float(drawdown.min()), 'std': std, 'sharpe': sharpe}
+    if len(done):
+        stats.update({'mean': float(done.mean()), 'median': float(np.median(done)),
+                      'win_rate': float((done > 0).mean()),
+                      'best': float(done.max()), 'worst': float(done.min())})
     else:
-        annual = float('nan')
-
-    mean, std = float(values.mean()), float(values.std(ddof=1)) if len(values) > 1 else 0.0
-    sharpe = (mean / std * math.sqrt(trading_days_per_year)) if std > 0 else float('nan')
-
-    return {'days': len(values), 'total': total, 'annual': annual,
-            'max_drawdown': float(drawdown.min()), 'mean': mean, 'std': std,
-            'sharpe': sharpe, 'win_rate': float((values > 0).mean()),
-            'best': float(values.max()), 'worst': float(values.min()),
-            'median': float(np.median(values))}
+        stats.update({'mean': 0.0, 'median': 0.0, 'win_rate': 0.0,
+                      'best': 0.0, 'worst': 0.0})
+    return stats
 
 
 def rank_stats(detail: pd.DataFrame, column: str = 'ret',
                trading_days_per_year: int = 244) -> List[Tuple[str, Dict[str, float]]]:
-    """按名次分组统计，最后再加一行 TOP-N 等权组合"""
+    """
+    按名次分组统计，最后再加一行 TOP-N 等权组合。
+
+    买不进的那天不是「跳过这天」而是「当天持币」，所以净值曲线里记 0，
+    只有日均 / 胜率这些逐笔指标才排除掉它。
+    """
     out = []
-    for rank in sorted(detail['rank'].unique()):
+    ranks = sorted(detail['rank'].unique())
+    for rank in ranks:
         rows = detail[detail['rank'] == rank].sort_values('date')
-        stats = curve_stats(rows[column].to_numpy(dtype=float), trading_days_per_year)
+        values = rows[column].to_numpy(dtype=float)
+        stats = curve_stats(values, values[np.isfinite(values)], trading_days_per_year)
         if stats:
             stats['signals'] = int(len(rows))
-            stats['traded'] = int(rows[column].notna().sum())
             out.append((f'第 {rank} 名', stats))
 
-    daily = detail.groupby('date')[column].mean()         # 每日等权持有当天上榜的几只
-    stats = curve_stats(daily.to_numpy(dtype=float), trading_days_per_year)
-    if stats:
-        stats['signals'] = int(len(detail))
-        stats['traded'] = int(detail[column].notna().sum())
-        out.append((f'TOP{detail["rank"].max()} 等权', stats))
+    if len(ranks) > 1:
+        daily = _portfolio_daily(detail, column, len(ranks))
+        done = detail[column].to_numpy(dtype=float)
+        stats = curve_stats(daily.to_numpy(dtype=float), done[np.isfinite(done)],
+                            trading_days_per_year)
+        if stats:
+            stats['signals'] = int(len(detail))
+            out.append((f'TOP{int(detail["rank"].max())} 等权', stats))
     return out
+
+
+def _portfolio_daily(detail: pd.DataFrame, column: str, slots: int) -> pd.Series:
+    """
+    等权组合的逐日收益：每个名次一个仓位，买不进的那个仓位当天空着（记 0），
+    所以是「当天成交的收益之和 ÷ 名次数」，不是「成交那几只的平均」。
+    """
+    return detail.groupby('date')[column].sum(min_count=0).sort_index() / float(slots)
 
 
 STAT_COLUMNS = (('口径', 12, True), ('笔数', 7, False), ('日均', 9, False),
@@ -3217,10 +3299,10 @@ def format_stats(rows: Sequence[Tuple[str, Dict[str, float]]], title: str) -> st
     header = '  ' + ' '.join(pad(name, width, left) for name, width, left in STAT_COLUMNS)
     rule = '=' * display_width(header)
     lines = [rule, title, rule, header]
-    for label, s in rows:
-        values = [label, str(s.get('traded', s['days'])), f"{s['mean']:.3%}",
-                  f"{s['median']:.3%}", f"{s['win_rate']:.1%}", f"{s['total']:.2%}",
-                  f"{s['annual']:.2%}", f"{s['max_drawdown']:.2%}", f"{s['sharpe']:.2f}"]
+    for label, st in rows:
+        values = [label, f"{st['traded']}/{st['days']}", f"{st['mean']:.3%}",
+                  f"{st['median']:.3%}", f"{st['win_rate']:.1%}", f"{st['total']:.2%}",
+                  f"{st['annual']:.2%}", f"{st['max_drawdown']:.2%}", f"{st['sharpe']:.2f}"]
         lines.append('  ' + ' '.join(pad(v, w, left)
                                      for v, (_, w, left) in zip(values, STAT_COLUMNS)))
     lines.append(rule)
@@ -3231,13 +3313,13 @@ def format_notes(detail: pd.DataFrame) -> str:
     counts = detail['note'].value_counts()
     total = len(detail)
     done = int(counts.get(TRADED, 0))
-    lines = [f'  信号 {total} 条，成交 {done} 条（{done / total:.1%}）']
+    lines = [f'  信号 {total} 条，成交 {done} 条（{done / total:.1%}），其余当天持币']
     for note, count in counts.items():
         if note != TRADED:
-            lines.append(f'    {note}: {count} 条')
-    best = detail.loc[detail['ret'].idxmax()] if detail['ret'].notna().any() else None
-    worst = detail.loc[detail['ret'].idxmin()] if detail['ret'].notna().any() else None
-    if best is not None:
+            lines.append(f'    {note}: {count} 条（{count / total:.1%}）')
+    if detail['ret'].notna().any():
+        best = detail.loc[detail['ret'].idxmax()]
+        worst = detail.loc[detail['ret'].idxmin()]
         lines.append(f"  单笔最好: {best['date']} 第{best['rank']}名 {best['stock']} "
                      f"{best['name']} {best['ret']:+.2%}")
         lines.append(f"  单笔最差: {worst['date']} 第{worst['rank']}名 {worst['stock']} "
@@ -3246,11 +3328,12 @@ def format_notes(detail: pd.DataFrame) -> str:
 
 
 def portfolio_equity(detail: pd.DataFrame, column: str = 'ret') -> pd.DataFrame:
-    """TOP-N 等权组合的逐日收益与净值"""
-    daily = detail.groupby('date')[column].mean().sort_index()
-    daily = daily[np.isfinite(daily.to_numpy(dtype=float))]
-    return pd.DataFrame({'date': daily.index, 'ret': daily.to_numpy(),
-                         'equity': np.cumprod(1.0 + daily.to_numpy())})
+    """TOP-N 等权组合的逐日收益与净值（买不进的仓位当天记 0）"""
+    slots = int(detail['rank'].nunique())
+    daily = _portfolio_daily(detail, column, slots)
+    values = np.nan_to_num(daily.to_numpy(dtype=float), nan=0.0)
+    return pd.DataFrame({'date': daily.index, 'ret': values,
+                         'equity': np.cumprod(1.0 + values)})
 
 
 # ============================================================
@@ -3269,7 +3352,8 @@ def pad_end_date(last_signal: str, delay: int, hold: int, max_sell_delay: int) -
 def run_score_returns(source: DataSource, board_path: str, delay: int = 1, hold: int = 1,
                       account: Optional[AccountConfig] = None, ranks: Sequence[int] = (),
                       out_path: str = '', download: bool = False, end_date: str = '',
-                      trading_days_per_year: int = 244, max_sell_delay: int = 20
+                      trading_days_per_year: int = 244, max_sell_delay: int = 20,
+                      skip_limit_up: bool = False, limit_tolerance: float = 0.003
                       ) -> pd.DataFrame:
     board = load_scoreboard(board_path)
     if ranks:
@@ -3283,18 +3367,28 @@ def run_score_returns(source: DataSource, board_path: str, delay: int = 1, hold:
              start, last, len(board), board['stock'].nunique())
 
     panel = build_open_panel(source, board['stock'].unique(), start, end, download)
-    detail = score_returns(board, panel, delay, hold, account, max_sell_delay)
+    detail = score_returns(board, panel, delay, hold, account, max_sell_delay,
+                           skip_limit_up, limit_tolerance)
 
     entry = '次日' if delay == 1 else f'信号日之后第 {delay} 个交易日'
     exit_ = '第二天' if hold == 1 else f'持有 {hold} 个交易日后'
-    title = f'[{entry}开盘买入 / {exit_}开盘卖出]  {start} ~ {last}'
+    picked = '第 %s 名' % '/'.join(str(r) for r in sorted(board['rank'].unique()))
+    title = f'[{entry}开盘买入 / {exit_}开盘卖出]  {picked}  {start} ~ {last}'
+    if skip_limit_up:
+        title += '  剔除买入日开盘涨停'
 
     print(format_stats(rank_stats(detail, 'ret', trading_days_per_year), title + '  不计费用'))
     print(format_notes(detail))
     print()
     print(format_stats(rank_stats(detail, 'ret_net', trading_days_per_year),
                        title + '  扣佣金/过户费/印花税'))
-    print('  未建模：一字涨停买不进、一字跌停卖不掉、滑点与冲击成本')
+    if skip_limit_up:
+        print('  「笔数」是 成交/信号日；买不进的那天按持币记 0，不是从曲线里抹掉')
+        print(f'  涨停判定：开盘涨幅 >= 涨停幅度 - {limit_tolerance:.1%}'
+              '（主板 10%、创业板/科创板 20%、主板 ST 5%、北交所 30%）')
+        print('  仍未建模：一字跌停卖不掉、滑点与冲击成本')
+    else:
+        print('  未建模：一字涨停买不进、一字跌停卖不掉、滑点与冲击成本')
 
     if out_path:
         folder = os.path.dirname(os.path.abspath(out_path))
@@ -3678,6 +3772,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help='--eval-scores：信号日之后第 N 个交易日开盘买入，默认 1（次日）')
     p.add_argument('--hold-days', type=int, default=1, metavar='N',
                    help='--eval-scores：买入后持有 N 个交易日，在那天开盘卖出，默认 1')
+    p.add_argument('--skip-limit-up', action='store_true',
+                   help='--eval-scores：剔除买入日开盘就涨停的信号（挂单买不进），'
+                        '该日按持币计入曲线')
+    p.add_argument('--limit-tolerance', type=float, default=0.003, metavar='X',
+                   help='--eval-scores：涨停判定的容差，默认 0.003（10%% 的票按 9.7%% 算封板）')
     p.add_argument('--eval-ranks', type=int, nargs='+', default=[], metavar='K',
                    help='--eval-scores：只评估这些名次，默认全部')
     p.add_argument('--eval-out', default='',
@@ -3855,7 +3954,12 @@ def eval_out_path(args) -> str:
     if args.eval_out:
         return args.eval_out
     base, ext = os.path.splitext(args.eval_scores)
-    return f'{base}_returns_d{args.entry_delay}h{args.hold_days}{ext or ".csv"}'
+    tag = f'd{args.entry_delay}h{args.hold_days}'
+    if args.eval_ranks:
+        tag += 'r' + ''.join(str(r) for r in sorted(args.eval_ranks))
+    if args.skip_limit_up:
+        tag += '_noup'
+    return f'{base}_returns_{tag}{ext or ".csv"}'
 
 
 def run_score_eval(args) -> int:
@@ -3873,6 +3977,8 @@ def run_score_eval(args) -> int:
         ranks=args.eval_ranks,
         out_path=eval_out_path(args),
         download=args.download,
+        skip_limit_up=args.skip_limit_up,
+        limit_tolerance=args.limit_tolerance,
     )
     return 0
 

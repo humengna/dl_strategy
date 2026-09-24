@@ -47,7 +47,7 @@ python dl_strategy_xtdata.py --eval-scores results/scores_xxx.csv        # 榜�
 ```bash
 cd momentum_strategy
 pip install -r requirements-dev.txt
-python -m pytest                                      # 252 个用例，不需要 QMT
+python -m pytest                                      # 262 个用例，不需要 QMT
 
 # 离线试跑（任何平台）
 python tools/make_sample_data.py --out data/sample --days 700

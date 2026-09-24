@@ -278,3 +278,26 @@ def test_eval_scores_只看第一名(tmp_path, capsys):
           '--eval-ranks', '1', '--no-save', '-q'])
     text = capsys.readouterr().out
     assert '第 1 名' in text and '第 2 名' not in text
+
+
+def test_skip_limit_up_写进文件名并传到下游(tmp_path):
+    from momentum.cli import build_parser, eval_out_path
+    args = build_parser().parse_args(['--eval-scores', 'a/scores.csv',
+                                      '--eval-ranks', '1', '--skip-limit-up'])
+    assert args.skip_limit_up is True
+    assert eval_out_path(args) == os.path.join('a', 'scores_returns_d1h1r1_noup.csv')
+
+
+def test_eval_scores_剔除涨停跑得通(tmp_path, capsys):
+    data_dir = write_sample_dir(str(tmp_path / 'data'), days=300, start='20230103')
+    out = tmp_path / 'out'
+    main(['--source', 'csv', '--data-dir', data_dir,
+          '--start', '20240102', '--end', '20240331',
+          '--top-scores', '5', '--out-dir', str(out), '-q'])
+    board = str(out / [f for f in os.listdir(out) if f.startswith('scores_')][0])
+
+    assert main(['--source', 'csv', '--data-dir', data_dir, '--eval-scores', board,
+                 '--eval-ranks', '1', '--skip-limit-up', '--no-save', '-q']) == 0
+    text = capsys.readouterr().out
+    assert '第 1 名' in text and '剔除买入日开盘涨停' in text
+    assert '第 2 名' not in text
